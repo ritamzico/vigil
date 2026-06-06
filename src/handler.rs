@@ -1,8 +1,9 @@
 use crate::index::Index;
-use crate::message::{Message, MessageKind};
+use crate::message::{Message, MessageKind, WatchPayload};
 use crate::parser::parse_query;
 use serde_json::from_slice;
 use serde_json::to_vec;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use thiserror::Error;
@@ -21,6 +22,7 @@ pub async fn handle_client(
     stream: UnixStream,
     index: Arc<RwLock<Index>>,
     shutdown_tx: mpsc::Sender<()>,
+    watch_tx: mpsc::Sender<(PathBuf, Option<String>)>,
     time_field: Option<String>,
 ) -> Result<(), HandlerError> {
     let (mut reader, mut writer) = stream.into_split();
@@ -47,6 +49,12 @@ pub async fn handle_client(
         MessageKind::Shutdown => {
             response = Message::new(MessageKind::ShutdownAck, String::new());
             let _ = shutdown_tx.send(()).await;
+        }
+        MessageKind::Watch => {
+            let payload: WatchPayload = serde_json::from_str(message.get_message_data())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let _ = watch_tx.send((payload.path, payload.time_field)).await;
+            response = Message::new(MessageKind::WatchAck, String::new());
         }
         _ => panic!("Invalid Message variant"),
     }
@@ -89,7 +97,8 @@ mod tests {
     async fn roundtrip(index: Arc<RwLock<Index>>, msg: Message) -> (Message, mpsc::Receiver<()>) {
         let (client, server) = UnixStream::pair().unwrap();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-        tokio::spawn(handle_client(server, index, shutdown_tx, None));
+        let (watch_tx, _watch_rx) = mpsc::channel(1);
+        tokio::spawn(handle_client(server, index, shutdown_tx, watch_tx, None));
 
         let (mut reader, mut writer) = client.into_split();
         writer.write_all(&to_vec(&msg).unwrap()).await.unwrap();

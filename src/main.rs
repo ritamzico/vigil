@@ -1,5 +1,5 @@
 use clap::Parser;
-use message::{Message, MessageKind};
+use message::{Message, MessageKind, WatchPayload};
 use serde_json::{from_slice, to_vec};
 use std::fs::File;
 use std::path::Path;
@@ -83,7 +83,10 @@ async fn run_daemon(path: PathBuf, detach: bool, time_field: Option<String>) {
     }
 
     if Path::new(message::SOCKET_PATH).exists() {
-        std::fs::remove_file(message::SOCKET_PATH).unwrap();
+        match send_watch(file_path.clone(), time_field.clone()).await {
+            Ok(()) => return,
+            Err(_) => std::fs::remove_file(message::SOCKET_PATH).ok(),
+        };
     }
 
     let listener = UnixListener::bind(message::SOCKET_PATH).unwrap();
@@ -94,6 +97,8 @@ async fn run_daemon(path: PathBuf, detach: bool, time_field: Option<String>) {
         time_field.clone(),
     ));
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let (watch_tx, mut watch_rx) = mpsc::channel::<(PathBuf, Option<String>)>(1);
+    let mut current_time_field = time_field;
 
     loop {
         tokio::select! {
@@ -105,7 +110,13 @@ async fn run_daemon(path: PathBuf, detach: bool, time_field: Option<String>) {
                 break;
             }
             Ok((stream, _)) = listener.accept() => {
-                let client_handle = tokio::spawn(handler::handle_client(stream, index.clone(), shutdown_tx.clone(), time_field.clone()));
+                let client_handle = tokio::spawn(handler::handle_client(
+                    stream,
+                    index.clone(),
+                    shutdown_tx.clone(),
+                    watch_tx.clone(),
+                    current_time_field.clone(),
+                ));
                 if let Err(e) = client_handle.await.unwrap() {
                     eprintln!("Client error: {e}");
                 }
@@ -113,10 +124,34 @@ async fn run_daemon(path: PathBuf, detach: bool, time_field: Option<String>) {
             _ = shutdown_rx.recv() => {
                 break;
             }
+            Some((new_path, new_time_field)) = watch_rx.recv() => {
+                tailer_handle.abort();
+                let _ = tailer_handle.await;
+                *index.write().unwrap() = index::Index::new();
+                current_time_field = new_time_field.clone();
+                tailer_handle = tokio::spawn(tailer::run_tailer(new_path, index.clone(), new_time_field));
+            }
         }
     }
 
     std::fs::remove_file(message::SOCKET_PATH).ok();
+}
+
+async fn send_watch(path: PathBuf, time_field: Option<String>) -> Result<(), io::Error> {
+    let stream = UnixStream::connect(message::SOCKET_PATH).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    let payload = WatchPayload { path, time_field };
+    let msg = Message::new(MessageKind::Watch, serde_json::to_string(&payload).unwrap());
+    writer.write_all(&to_vec(&msg).unwrap()).await?;
+    writer.shutdown().await?;
+    let mut buf = vec![];
+    reader.read_to_end(&mut buf).await?;
+    let response: Message = from_slice(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    match response.get_message_kind() {
+        MessageKind::WatchAck => Ok(()),
+        _ => Err(io::Error::new(io::ErrorKind::Other, "unexpected response")),
+    }
 }
 
 async fn run_stop() {

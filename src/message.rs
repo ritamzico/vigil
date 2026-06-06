@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub const SOCKET_PATH: &str = "/tmp/vigil.sock";
 
@@ -9,6 +10,14 @@ pub enum MessageKind {
     QueryError,
     Shutdown,
     ShutdownAck,
+    Watch,
+    WatchAck,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WatchPayload {
+    pub path: PathBuf,
+    pub time_field: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
