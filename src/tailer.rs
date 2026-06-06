@@ -85,7 +85,12 @@ mod tests {
         Arc::new(RwLock::new(Index::new()))
     }
 
-    async fn read(path: &str, index: &Arc<RwLock<Index>>, offset: u64, time_field: Option<&str>) -> u64 {
+    async fn read(
+        path: &str,
+        index: &Arc<RwLock<Index>>,
+        offset: u64,
+        time_field: Option<&str>,
+    ) -> u64 {
         read_file(&PathBuf::from(path), index, offset, time_field)
             .await
             .unwrap()
@@ -216,7 +221,10 @@ mod tests {
         let index = make_index();
         read("test_files/timestamps.log", &index, 0, None).await;
         let idx = index.read().unwrap();
-        let q = Query::TimeRange { start: None, end: None };
+        let q = Query::TimeRange {
+            start: None,
+            end: None,
+        };
         assert_eq!(idx.apply_query(&q).len(), 0);
     }
 
@@ -225,7 +233,10 @@ mod tests {
         let index = make_index();
         read("test_files/timestamps.log", &index, 0, Some("created_at")).await;
         let idx = index.read().unwrap();
-        let q = Query::TimeRange { start: None, end: None };
+        let q = Query::TimeRange {
+            start: None,
+            end: None,
+        };
         assert_eq!(idx.apply_query(&q).len(), 0);
     }
 
@@ -328,7 +339,13 @@ mod tests {
         let index = make_index();
         let result = read_file(&PathBuf::from("test_files/non-json.log"), &index, 0, None).await;
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("line 1"), "expected line number in error: {err}");
-        assert!(err.contains("bruh"), "expected line content in error: {err}");
+        assert!(
+            err.contains("line 1"),
+            "expected line number in error: {err}"
+        );
+        assert!(
+            err.contains("Lorem"),
+            "expected line content in error: {err}"
+        );
     }
 }
