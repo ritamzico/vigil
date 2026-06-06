@@ -1,0 +1,25 @@
+{"time": "2026-04-18T10:30:01Z", "level": "DEBUG", "method": "GET", "path": "/api/health", "latency_ms": 5, "status": 200}
+{"time": "2026-04-18T10:30:03Z", "level": "INFO", "method": "GET", "path": "/api/users", "user_id": 101, "latency_ms": 45, "status": 200}
+{"time": "2026-04-18T10:30:05Z", "level": "INFO", "method": "POST", "path": "/api/orders", "user_id": 204, "latency_ms": 120, "status": 201}
+{"time": "2026-04-18T10:30:07Z", "level": "WARN", "method": "GET", "path": "/api/orders", "user_id": 101, "latency_ms": 850, "status": 200}
+{"time": "2026-04-18T10:30:09Z", "level": "ERROR", "method": "POST", "path": "/api/checkout", "user_id": 307, "latency_ms": 2400, "status": 500}
+{"time": "2026-04-18T10:30:11Z", "level": "INFO", "method": "GET", "path": "/api/products", "user_id": 502, "latency_ms": 62, "status": 200}
+{"time": "2026-04-18T10:30:13Z", "level": "INFO", "method": "PUT", "path": "/api/users", "user_id": 101, "latency_ms": 98, "status": 200}
+{"time": "2026-04-18T10:30:15Z", "level": "ERROR", "method": "POST", "path": "/api/checkout", "user_id": 204, "latency_ms": 3100, "status": 500}
+{"time": "2026-04-18T10:30:17Z", "level": "INFO", "method": "GET", "path": "/api/orders", "user_id": 101, "latency_ms": 95, "status": 200}
+{"time": "2026-04-18T10:30:19Z", "level": "WARN", "method": "DELETE", "path": "/api/users", "user_id": 307, "latency_ms": 410, "status": 403}
+{"time": "2026-04-18T10:30:21Z", "level": "INFO", "method": "GET", "path": "/api/users", "user_id": 204, "latency_ms": 52, "status": 200}
+{"time": "2026-04-18T10:30:23Z", "level": "ERROR", "method": "POST", "path": "/api/checkout", "user_id": 101, "latency_ms": 1800, "status": 500}
+{"time": "2026-04-18T10:30:25Z", "level": "INFO", "method": "GET", "path": "/api/auth", "user_id": 615, "latency_ms": 33, "status": 200}
+{"time": "2026-04-18T10:30:27Z", "level": "WARN", "method": "POST", "path": "/api/auth", "user_id": 720, "latency_ms": 280, "status": 401}
+{"time": "2026-04-18T10:30:29Z", "level": "ERROR", "method": "GET", "path": "/api/products", "user_id": 502, "latency_ms": 5000, "status": 502}
+{"time": "2026-04-18T10:30:31Z", "level": "INFO", "method": "PATCH", "path": "/api/orders", "user_id": 204, "latency_ms": 75, "status": 200}
+{"time": "2026-04-18T10:30:33Z", "level": "DEBUG", "method": "GET", "path": "/api/health", "latency_ms": 4, "status": 200}
+{"time": "2026-04-18T10:30:35Z", "level": "INFO", "method": "POST", "path": "/api/users", "user_id": 720, "latency_ms": 145, "status": 201}
+{"time": "2026-04-18T10:30:37Z", "level": "ERROR", "method": "POST", "path": "/api/checkout", "user_id": 615, "latency_ms": 4200, "status": 503}
+{"time": "2026-04-18T10:30:39Z", "level": "WARN", "method": "GET", "path": "/api/orders", "user_id": 307, "latency_ms": 920, "status": 429}
+{"time": "2026-04-18T10:30:41Z", "level": "INFO", "method": "GET", "path": "/api/users", "user_id": 101, "latency_ms": 41, "status": 200}
+{"time": "2026-04-18T10:30:43Z", "level": "ERROR", "method": "DELETE", "path": "/api/products", "user_id": 502, "latency_ms": 1100, "status": 404}
+{"time": "2026-04-18T10:30:45Z", "level": "INFO", "method": "GET", "path": "/api/orders", "user_id": 615, "latency_ms": 67, "status": 200}
+{"time": "2026-04-18T10:30:47Z", "level": "ERROR", "method": "POST", "path": "/api/auth", "user_id": 720, "latency_ms": 890, "status": 400}
+{"time": "2026-04-", "level": "ERROR", "method": "POST", "path": "/api/checkout", "user_id": 101, "latency_ms": 1800, "status": 500}

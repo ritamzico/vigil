@@ -1,0 +1,10 @@
+{"name":"alice","age":30,"active":true,"score":9.5,"tags":["rust","go"],"meta":{"key":"val"}}
+{"name":"bob","age":25,"active":false,"score":6.2}
+{"name":"charlie","age":35,"active":true,"score":8.0,"tags":["python"]}
+{"name":"dana","age":28,"active":false,"score":7.5}
+{"name":"eve","age":42,"active":true,"score":9.9,"meta":{"role":"admin"}}
+{"name":"frank","age":19,"active":true,"score":5.0}
+{"name":"grace","age":33,"active":false,"score":8.8,"tags":["java","kotlin"]}
+{"name":"henry","age":55,"active":true,"score":7.1}
+{"name":"iris","age":23,"active":false}
+{"name":"jack","age":38,"active":false,"score":6.6}
