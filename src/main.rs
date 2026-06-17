@@ -17,8 +17,10 @@ mod index;
 mod message;
 mod parser;
 mod query;
+mod snapshot;
 mod tailer;
 mod value;
+mod wal;
 
 #[derive(Parser)]
 struct Args {
@@ -146,8 +148,8 @@ async fn send_watch(path: PathBuf, time_field: Option<String>) -> Result<(), io:
     writer.shutdown().await?;
     let mut buf = vec![];
     reader.read_to_end(&mut buf).await?;
-    let response: Message = from_slice(&buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let response: Message =
+        from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     match response.get_message_kind() {
         MessageKind::WatchAck => Ok(()),
         _ => Err(io::Error::new(io::ErrorKind::Other, "unexpected response")),
