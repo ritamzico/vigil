@@ -21,7 +21,7 @@ pub async fn run_tailer(
     file_path: PathBuf,
     index: Arc<RwLock<Index>>,
     time_field: Option<String>,
-    wal: Arc<Mutex<WAL>>,
+    wal: Option<Arc<Mutex<WAL>>>,
     starting_byte_offset: u64,
 ) -> Result<(), io::Error> {
     let mut byte_offset = starting_byte_offset;
@@ -38,7 +38,7 @@ async fn read_file(
     index: &Arc<RwLock<Index>>,
     mut byte_offset: u64,
     time_field: Option<&str>,
-    wal: &Arc<Mutex<WAL>>,
+    wal: &Option<Arc<Mutex<WAL>>>,
 ) -> Result<u64, io::Error> {
     let file = File::open(file_path).await?;
     let mut reader = io::BufReader::new(file);
@@ -77,10 +77,12 @@ async fn read_file(
 
         let event = Event::new(timestamp, line, fields);
 
-        wal.lock()
-            .await
-            .append(byte_offset, PersistedEvent::from_event(&event))
-            .await?;
+        if let Some(wal) = wal {
+            wal.lock()
+                .await
+                .append(byte_offset, PersistedEvent::from_event(&event))
+                .await?;
+        }
 
         index.write().unwrap().push_event(event);
     }
@@ -98,10 +100,10 @@ mod tests {
         Arc::new(RwLock::new(Index::new()))
     }
 
-    async fn make_wal() -> Arc<Mutex<WAL>> {
+    async fn make_wal() -> Option<Arc<Mutex<WAL>>> {
         let tmp = NamedTempFile::new().unwrap();
         let wal = WAL::open(tmp.path(), None).await.unwrap();
-        Arc::new(Mutex::new(wal))
+        Some(Arc::new(Mutex::new(wal)))
     }
 
     async fn read(
@@ -122,6 +124,22 @@ mod tests {
         let offset = read("test_files/empty.log", &index, 0, None).await;
         assert_eq!(offset, 0);
         assert_eq!(index.read().unwrap().event_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_no_wal_still_indexes_events() {
+        let index = make_index();
+        let offset = read_file(
+            &PathBuf::from("test_files/test.log"),
+            &index,
+            0,
+            None,
+            &None,
+        )
+        .await
+        .unwrap();
+        assert!(offset > 0);
+        assert_eq!(index.read().unwrap().event_count(), 25);
     }
 
     #[tokio::test]
