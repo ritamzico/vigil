@@ -31,10 +31,10 @@ pub async fn recover(dir: &Path) -> io::Result<Recovered> {
     let mut byte_offset: u64 = 0;
 
     if let Some(snapshot) = Snapshot::load(dir).await? {
-        next_seq = snapshot.next_seq();
-        byte_offset = snapshot.byte_offset();
+        next_seq = snapshot.next_seq;
+        byte_offset = snapshot.byte_offset;
 
-        for event in snapshot.into_events() {
+        for event in snapshot.events {
             index.push_event(event.into_event());
         }
     };
@@ -53,8 +53,8 @@ pub async fn recover(dir: &Path) -> io::Result<Recovered> {
         index.push_event(record.event.into_event());
     }
 
-    wal.set_next_seq(next_seq);
-    wal.set_last_byte_offset(byte_offset);
+    wal.next_seq = next_seq;
+    wal.last_byte_offset = byte_offset;
 
     Ok(Recovered::new(index, wal, byte_offset))
 }

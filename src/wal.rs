@@ -49,14 +49,6 @@ impl WAL {
         })
     }
 
-    pub fn set_next_seq(&mut self, next_seq: u64) {
-        self.next_seq = next_seq;
-    }
-
-    pub fn set_last_byte_offset(&mut self, last_byte_offset: u64) {
-        self.last_byte_offset = last_byte_offset;
-    }
-
     pub async fn append(&mut self, byte_offset: u64, event: PersistedEvent) -> io::Result<()> {
         let record = &WALRecord::new(self.next_seq, byte_offset, event);
 

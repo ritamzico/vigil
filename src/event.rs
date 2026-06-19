@@ -7,9 +7,9 @@ use wincode::{SchemaRead, SchemaWrite};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Event {
-    timestamp: Option<DateTime<Utc>>,
-    raw: String,
-    fields: HashMap<String, Value>,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub raw: String,
+    pub fields: HashMap<String, Value>,
 }
 
 impl Event {
@@ -23,18 +23,6 @@ impl Event {
             raw,
             fields,
         }
-    }
-
-    pub fn get_timestamp(&self) -> &Option<DateTime<Utc>> {
-        &self.timestamp
-    }
-
-    pub fn get_raw(&self) -> &String {
-        &self.raw
-    }
-
-    pub fn get_fields(&self) -> &HashMap<String, Value> {
-        &self.fields
     }
 }
 

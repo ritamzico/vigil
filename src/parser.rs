@@ -225,11 +225,11 @@ mod tests {
     }
 
     fn parse_filter(s: &str) -> Result<Query, ParseError> {
-        parse_query(s, None).map(|plan| plan.get_query().clone())
+        parse_query(s, None).map(|plan| plan.query.clone())
     }
 
     fn parse_filter_with_time(s: &str) -> Result<Query, ParseError> {
-        parse_query(s, Some("time")).map(|plan| plan.get_query().clone())
+        parse_query(s, Some("time")).map(|plan| plan.query.clone())
     }
 
     // --- Field comparisons ---
@@ -331,7 +331,7 @@ mod tests {
         // Any field name can be the time field — it's whatever the daemon was started with.
         assert!(matches!(
             parse_query("created_at > 2026-01-01T00:00:00Z", Some("created_at")),
-            Ok(ref plan) if matches!(plan.get_query(), Query::TimeRange { .. })
+            Ok(ref plan) if matches!(plan.query, Query::TimeRange { .. })
         ));
     }
 
@@ -532,34 +532,34 @@ mod tests {
     fn test_count_aggregation() {
         let plan = parse_query("status = 500 | count", None).unwrap();
         assert_eq!(
-            plan.get_query(),
-            &field("status", ComparisonOp::Eq, Value::Number(500.0))
+            plan.query,
+            field("status", ComparisonOp::Eq, Value::Number(500.0))
         );
-        assert!(matches!(plan.get_aggregation(), Some(Aggregation::Count)));
+        assert!(matches!(plan.aggregation, Some(Aggregation::Count)));
     }
 
     #[test]
     fn test_avg_aggregation() {
         let plan = parse_query("status = 500 | avg latency_ms", None).unwrap();
         assert_eq!(
-            plan.get_query(),
-            &field("status", ComparisonOp::Eq, Value::Number(500.0))
+            plan.query,
+            field("status", ComparisonOp::Eq, Value::Number(500.0))
         );
         assert!(
-            matches!(plan.get_aggregation(), Some(Aggregation::Average(f)) if f == "latency_ms")
+            matches!(plan.aggregation, Some(Aggregation::Average(f)) if f == "latency_ms")
         );
     }
 
     #[test]
     fn test_count_with_and_filter() {
         let plan = parse_query("status = 500 AND level = ERROR | count", None).unwrap();
-        assert!(matches!(plan.get_aggregation(), Some(Aggregation::Count)));
+        assert!(matches!(plan.aggregation, Some(Aggregation::Count)));
     }
 
     #[test]
     fn test_no_aggregation() {
         let plan = parse_query("status = 500", None).unwrap();
-        assert!(plan.get_aggregation().is_none());
+        assert!(plan.aggregation.is_none());
     }
 
     #[test]
@@ -606,7 +606,7 @@ mod tests {
     fn test_p99_aggregation() {
         let plan = parse_query("status = 500 | p99 latency_ms", None).unwrap();
         assert!(
-            matches!(plan.get_aggregation(), Some(Aggregation::Percentage(f, p)) if f == "latency_ms" && (*p - 0.99).abs() < 1e-6)
+            matches!(plan.aggregation, Some(Aggregation::Percentage(f, p)) if f == "latency_ms" && (p - 0.99).abs() < 1e-6)
         );
     }
 
@@ -614,7 +614,7 @@ mod tests {
     fn test_p50_aggregation() {
         let plan = parse_query("status = 500 | p50 latency_ms", None).unwrap();
         assert!(
-            matches!(plan.get_aggregation(), Some(Aggregation::Percentage(f, p)) if f == "latency_ms" && (*p - 0.50).abs() < 1e-6)
+            matches!(plan.aggregation, Some(Aggregation::Percentage(f, p)) if f == "latency_ms" && (p - 0.50).abs() < 1e-6)
         );
     }
 
@@ -622,7 +622,7 @@ mod tests {
     fn test_p1_aggregation() {
         let plan = parse_query("status = 500 | p1 latency_ms", None).unwrap();
         assert!(
-            matches!(plan.get_aggregation(), Some(Aggregation::Percentage(_, p)) if (*p - 0.01).abs() < 1e-6)
+            matches!(plan.aggregation, Some(Aggregation::Percentage(_, p)) if (p - 0.01).abs() < 1e-6)
         );
     }
 
@@ -630,7 +630,7 @@ mod tests {
     fn test_p100_aggregation() {
         let plan = parse_query("status = 500 | p100 latency_ms", None).unwrap();
         assert!(
-            matches!(plan.get_aggregation(), Some(Aggregation::Percentage(_, p)) if (*p - 1.0).abs() < 1e-6)
+            matches!(plan.aggregation, Some(Aggregation::Percentage(_, p)) if (p - 1.0).abs() < 1e-6)
         );
     }
 

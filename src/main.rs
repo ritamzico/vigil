@@ -253,7 +253,7 @@ async fn send_watch(path: PathBuf, time_field: Option<String>) -> Result<(), io:
     reader.read_to_end(&mut buf).await?;
     let response: Message =
         from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    match response.get_message_kind() {
+    match response.message_kind {
         MessageKind::WatchAck => Ok(()),
         _ => Err(io::Error::new(io::ErrorKind::Other, "unexpected response")),
     }
@@ -285,7 +285,7 @@ async fn run_stop() {
         }
     };
 
-    match response.get_message_kind() {
+    match response.message_kind {
         MessageKind::ShutdownAck => println!("Daemon stopped."),
         _ => {
             eprintln!("Unexpected response from daemon.");
@@ -327,10 +327,10 @@ async fn run_query(raw_query: String) {
         }
     };
 
-    match response.get_message_kind() {
-        MessageKind::QueryResponse => println!("{}", response.get_message_data()),
+    match response.message_kind {
+        MessageKind::QueryResponse => println!("{}", response.data),
         MessageKind::QueryError => {
-            eprintln!("Error: {}", response.get_message_data());
+            eprintln!("Error: {}", response.data);
             std::process::exit(1);
         }
         _ => {

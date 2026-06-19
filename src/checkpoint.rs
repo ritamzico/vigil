@@ -98,9 +98,9 @@ mod tests {
             .unwrap();
 
         let snapshot = Snapshot::load(dir.path()).await.unwrap().unwrap();
-        assert_eq!(snapshot.next_seq(), 2);
-        assert_eq!(snapshot.byte_offset(), 15);
-        assert_eq!(snapshot.into_events().len(), 2);
+        assert_eq!(snapshot.next_seq, 2);
+        assert_eq!(snapshot.byte_offset, 15);
+        assert_eq!(snapshot.events.len(), 2);
     }
 
     #[tokio::test]
@@ -131,9 +131,9 @@ mod tests {
         checkpoint(dir.path(), &index, &wal, &None).await.unwrap();
 
         let snapshot = Snapshot::load(dir.path()).await.unwrap().unwrap();
-        assert_eq!(snapshot.next_seq(), 0);
-        assert_eq!(snapshot.byte_offset(), 0);
-        assert_eq!(snapshot.into_events().len(), 0);
+        assert_eq!(snapshot.next_seq, 0);
+        assert_eq!(snapshot.byte_offset, 0);
+        assert_eq!(snapshot.events.len(), 0);
     }
 
     #[tokio::test]

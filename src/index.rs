@@ -31,7 +31,7 @@ pub struct Index {
 impl fmt::Display for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for event in &self.events {
-            writeln!(f, "{}", event.get_raw())?;
+            writeln!(f, "{}", event.raw)?;
         }
         Ok(())
     }
@@ -49,12 +49,12 @@ impl Index {
     pub fn push_event(&mut self, event: Event) {
         let i = self.events.len();
 
-        for (field, value) in event.get_fields() {
+        for (field, value) in &event.fields {
             let field_map = self.field_index.entry(field.clone()).or_default();
             field_map.entry(value.clone()).or_default().push(i);
         }
 
-        if let Some(timestamp) = *event.get_timestamp() {
+        if let Some(timestamp) = event.timestamp {
             self.time_index.entry(timestamp).or_default().push(i);
         }
 
@@ -70,8 +70,8 @@ impl Index {
         &'a self,
         query_plan: &QueryPlan,
     ) -> Result<QueryResult<'a>, AggregationError> {
-        let events = self.apply_query(query_plan.get_query());
-        let Some(aggregation) = query_plan.get_aggregation() else {
+        let events = self.apply_query(&query_plan.query);
+        let Some(aggregation) = &query_plan.aggregation else {
             return Ok(QueryResult::Events(events));
         };
 
@@ -84,7 +84,7 @@ impl Index {
 
                 let values: Vec<f32> = events
                     .iter()
-                    .filter_map(|event| event.get_fields().get(field))
+                    .filter_map(|event| event.fields.get(field))
                     .map(|value| match value {
                         Value::Number(n) => Ok(*n),
                         _ => Err(AggregationError::IncompatibleType(field.clone())),
@@ -111,7 +111,7 @@ impl Index {
 
                 let mut values: Vec<f32> = events
                     .iter()
-                    .filter_map(|event| event.get_fields().get(field))
+                    .filter_map(|event| event.fields.get(field))
                     .map(|value| match value {
                         Value::Number(n) => Ok(*n),
                         _ => Err(AggregationError::IncompatibleType(field.clone())),
@@ -126,7 +126,7 @@ impl Index {
             Aggregation::CountBy(field) => Ok(QueryResult::CountBy(
                 events
                     .iter()
-                    .filter(|event| event.get_fields().contains_key(field))
+                    .filter(|event| event.fields.contains_key(field))
                     .collect::<Vec<&&Event>>()
                     .len(),
             )),

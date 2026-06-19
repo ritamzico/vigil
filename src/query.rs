@@ -40,8 +40,8 @@ pub enum QueryResult<'a> {
 }
 
 pub struct QueryPlan {
-    query: Query,
-    aggregation: Option<Aggregation>,
+    pub query: Query,
+    pub aggregation: Option<Aggregation>,
 }
 
 pub enum Aggregation {
@@ -57,7 +57,7 @@ impl fmt::Display for QueryResult<'_> {
             QueryResult::Events(events) => {
                 let s = events
                     .iter()
-                    .map(|e| e.get_raw().as_str())
+                    .map(|e| e.raw.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
                 write!(f, "{}", s)
@@ -72,13 +72,5 @@ impl fmt::Display for QueryResult<'_> {
 impl QueryPlan {
     pub fn new(query: Query, aggregation: Option<Aggregation>) -> QueryPlan {
         QueryPlan { query, aggregation }
-    }
-
-    pub fn get_query(&self) -> &Query {
-        return &self.query;
-    }
-
-    pub fn get_aggregation(&self) -> &Option<Aggregation> {
-        return &self.aggregation;
     }
 }
