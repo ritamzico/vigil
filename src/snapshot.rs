@@ -13,7 +13,6 @@ const BIN_FILE_NAME: &str = "snapshot.bin";
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
 pub struct Snapshot {
-    schema_version: u32,
     time_field: Option<String>,
     pub next_seq: u64,
     pub byte_offset: u64,
@@ -22,14 +21,12 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn new(
-        schema_version: u32,
         time_field: Option<String>,
         byte_offset: u64,
         next_seq: u64,
         events: Vec<PersistedEvent>,
     ) -> Self {
         Snapshot {
-            schema_version,
             time_field,
             byte_offset,
             next_seq,
@@ -82,7 +79,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_snapshot(events: Vec<PersistedEvent>) -> Snapshot {
-        Snapshot::new(1, Some("timestamp".to_string()), 512, 42, events)
+        Snapshot::new(Some("timestamp".to_string()), 512, 42, events)
     }
 
     fn make_event(raw: &str) -> PersistedEvent {
@@ -125,7 +122,7 @@ mod tests {
         let first = make_snapshot(vec![make_event("first")]);
         first.save(dir.path()).await.unwrap();
 
-        let second = Snapshot::new(1, None, 0, 99, vec![make_event("second")]);
+        let second = Snapshot::new(None, 0, 99, vec![make_event("second")]);
         second.save(dir.path()).await.unwrap();
 
         let loaded = Snapshot::load(dir.path()).await.unwrap().unwrap();

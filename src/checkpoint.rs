@@ -20,7 +20,6 @@ pub async fn checkpoint(
     let snapshot = {
         let index_guard = index.read().unwrap();
         Snapshot::new(
-            1, // TODO: change
             time_field.clone(),
             wal_guard.last_byte_offset,
             wal_guard.next_seq,

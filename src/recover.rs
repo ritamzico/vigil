@@ -129,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn test_recover_loads_snapshot_with_no_new_wal_records() {
         let dir = tempdir().unwrap();
-        let snapshot = Snapshot::new(1, None, 50, 5, vec![make_event("from-snapshot")]);
+        let snapshot = Snapshot::new(None, 50, 5, vec![make_event("from-snapshot")]);
         snapshot.save(dir.path()).await.unwrap();
         // touch an empty wal.log so WAL::open succeeds
         WAL::open(&dir.path().join(WAL_FILE_NAME), None)
@@ -147,7 +147,7 @@ mod tests {
     async fn test_recover_merges_snapshot_and_new_wal_records() {
         let dir = tempdir().unwrap();
         let snapshot_events = vec![make_event("s0"), make_event("s1"), make_event("s2")];
-        Snapshot::new(1, None, 30, 3, snapshot_events)
+        Snapshot::new(None, 30, 3, snapshot_events)
             .save(dir.path())
             .await
             .unwrap();
@@ -167,7 +167,7 @@ mod tests {
         // holds 3-6 because truncation never happened.
         let dir = tempdir().unwrap();
         let snapshot_events: Vec<_> = (0..5).map(|i| make_event(&format!("s{i}"))).collect();
-        Snapshot::new(1, None, 40, 5, snapshot_events)
+        Snapshot::new(None, 40, 5, snapshot_events)
             .save(dir.path())
             .await
             .unwrap();
