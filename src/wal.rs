@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use tokio::{
-    fs::OpenOptions,
     fs::File,
+    fs::OpenOptions,
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
 };
 use wincode::{serialize, SchemaRead, SchemaWrite};
@@ -18,17 +18,23 @@ pub struct WALRecord {
 
 impl WALRecord {
     pub fn new(seq: u64, byte_offset: u64, event: PersistedEvent) -> Self {
-        WALRecord { seq, byte_offset, event }
+        WALRecord {
+            seq,
+            byte_offset,
+            event,
+        }
     }
 }
 
 pub struct WAL {
     reader: BufReader<File>,
     writer: BufWriter<File>,
+    pub next_seq: u64,
+    pub last_byte_offset: u64,
 }
 
 impl WAL {
-    pub async fn open(path: &Path) -> io::Result<Self> {
+    pub async fn open(path: &Path, starting_seq: Option<u64>) -> io::Result<Self> {
         let writer_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -38,10 +44,22 @@ impl WAL {
         Ok(WAL {
             reader: BufReader::new(reader_file),
             writer: BufWriter::new(writer_file),
+            next_seq: starting_seq.unwrap_or(0),
+            last_byte_offset: 0,
         })
     }
 
-    pub async fn append(&mut self, record: &WALRecord) -> io::Result<()> {
+    pub fn set_next_seq(&mut self, next_seq: u64) {
+        self.next_seq = next_seq;
+    }
+
+    pub fn set_last_byte_offset(&mut self, last_byte_offset: u64) {
+        self.last_byte_offset = last_byte_offset;
+    }
+
+    pub async fn append(&mut self, byte_offset: u64, event: PersistedEvent) -> io::Result<()> {
+        let record = &WALRecord::new(self.next_seq, byte_offset, event);
+
         let payload =
             serialize(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crc = crc32fast::hash(&payload);
@@ -51,6 +69,9 @@ impl WAL {
             .await?;
         self.writer.write_all(&payload).await?;
         self.writer.write_all(&crc.to_le_bytes()).await?;
+
+        self.next_seq += 1;
+        self.last_byte_offset = byte_offset;
 
         Ok(())
     }
@@ -123,21 +144,22 @@ mod tests {
 
     async fn open_temp_wal() -> (WAL, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();
-        let wal = WAL::open(tmp.path()).await.unwrap();
+        let wal = WAL::open(tmp.path(), None).await.unwrap();
         (wal, tmp)
     }
 
     #[tokio::test]
     async fn test_append_and_replay_single_record() {
         let (mut wal, _tmp) = open_temp_wal().await;
-        let record = WALRecord::new(1, 0, make_event("hello"));
 
-        wal.append(&record).await.unwrap();
+        wal.append(0, make_event("hello")).await.unwrap();
         wal.flush_fsync().await.unwrap();
 
         let records = wal.replay().await.unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0], record);
+        assert_eq!(records[0].seq, 0);
+        assert_eq!(records[0].byte_offset, 0);
+        assert_eq!(records[0].event, make_event("hello"));
     }
 
     #[tokio::test]
@@ -145,7 +167,9 @@ mod tests {
         let (mut wal, _tmp) = open_temp_wal().await;
 
         for i in 0..5u64 {
-            wal.append(&WALRecord::new(i, i * 100, make_event(&format!("event-{i}")))).await.unwrap();
+            wal.append(i * 100, make_event(&format!("event-{i}")))
+                .await
+                .unwrap();
         }
         wal.flush_fsync().await.unwrap();
 
@@ -168,7 +192,7 @@ mod tests {
     async fn test_truncate_clears_all_records() {
         let (mut wal, _tmp) = open_temp_wal().await;
 
-        wal.append(&WALRecord::new(0, 0, make_event("before truncate"))).await.unwrap();
+        wal.append(0, make_event("before truncate")).await.unwrap();
         wal.flush_fsync().await.unwrap();
         wal.truncate().await.unwrap();
 
@@ -180,8 +204,8 @@ mod tests {
     async fn test_crc_corruption_returns_error() {
         let tmp = NamedTempFile::new().unwrap();
         {
-            let mut wal = WAL::open(tmp.path()).await.unwrap();
-            wal.append(&WALRecord::new(1, 0, make_event("data"))).await.unwrap();
+            let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+            wal.append(0, make_event("data")).await.unwrap();
             wal.flush_fsync().await.unwrap();
         }
 
@@ -191,8 +215,20 @@ mod tests {
         bytes[mid] ^= 0xFF;
         tokio::fs::write(tmp.path(), &bytes).await.unwrap();
 
-        let mut wal = WAL::open(tmp.path()).await.unwrap();
+        let mut wal = WAL::open(tmp.path(), None).await.unwrap();
         let result = wal.replay().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_open_with_starting_seq_resumes_numbering() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mut wal = WAL::open(tmp.path(), Some(10)).await.unwrap();
+
+        wal.append(0, make_event("resumed")).await.unwrap();
+        wal.flush_fsync().await.unwrap();
+
+        let records = wal.replay().await.unwrap();
+        assert_eq!(records[0].seq, 10);
     }
 }

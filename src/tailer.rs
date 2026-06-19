@@ -1,6 +1,8 @@
 use crate::event::Event;
+use crate::event::PersistedEvent;
 use crate::index::Index;
 use crate::value::Value;
+use crate::wal::WAL;
 use chrono::DateTime;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -9,20 +11,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::fs::File;
-use tokio::io;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
+use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+
+const SLEEP_TIME: u64 = 100;
 
 pub async fn run_tailer(
     file_path: PathBuf,
     index: Arc<RwLock<Index>>,
     time_field: Option<String>,
+    wal: Arc<Mutex<WAL>>,
+    starting_byte_offset: u64,
 ) -> Result<(), io::Error> {
-    let mut byte_offset = 0;
+    let mut byte_offset = starting_byte_offset;
 
     loop {
-        byte_offset = read_file(&file_path, &index, byte_offset, time_field.as_deref()).await?;
-        sleep(Duration::from_millis(100)).await;
+        byte_offset =
+            read_file(&file_path, &index, byte_offset, time_field.as_deref(), &wal).await?;
+        sleep(Duration::from_millis(SLEEP_TIME)).await;
     }
 }
 
@@ -31,6 +38,7 @@ async fn read_file(
     index: &Arc<RwLock<Index>>,
     mut byte_offset: u64,
     time_field: Option<&str>,
+    wal: &Arc<Mutex<WAL>>,
 ) -> Result<u64, io::Error> {
     let file = File::open(file_path).await?;
     let mut reader = io::BufReader::new(file);
@@ -67,10 +75,14 @@ async fn read_file(
             }
         }
 
-        index
-            .write()
-            .unwrap()
-            .push_event(Event::new(timestamp, line, fields));
+        let event = Event::new(timestamp, line, fields);
+
+        wal.lock()
+            .await
+            .append(byte_offset, PersistedEvent::from_event(&event))
+            .await?;
+
+        index.write().unwrap().push_event(event);
     }
 
     Ok(byte_offset)
@@ -80,9 +92,16 @@ async fn read_file(
 mod tests {
     use super::*;
     use crate::query::{ComparisonOp, Query};
+    use tempfile::NamedTempFile;
 
     fn make_index() -> Arc<RwLock<Index>> {
         Arc::new(RwLock::new(Index::new()))
+    }
+
+    async fn make_wal() -> Arc<Mutex<WAL>> {
+        let tmp = NamedTempFile::new().unwrap();
+        let wal = WAL::open(tmp.path(), None).await.unwrap();
+        Arc::new(Mutex::new(wal))
     }
 
     async fn read(
@@ -91,7 +110,8 @@ mod tests {
         offset: u64,
         time_field: Option<&str>,
     ) -> u64 {
-        read_file(&PathBuf::from(path), index, offset, time_field)
+        let wal = make_wal().await;
+        read_file(&PathBuf::from(path), index, offset, time_field, &wal)
             .await
             .unwrap()
     }
@@ -324,11 +344,13 @@ mod tests {
     #[tokio::test]
     async fn test_nonexistent_file_returns_error() {
         let index = make_index();
+        let wal = make_wal().await;
         let result = read_file(
             &PathBuf::from("test_files/does_not_exist.log"),
             &index,
             0,
             None,
+            &wal,
         )
         .await;
         assert!(result.is_err());
@@ -337,7 +359,15 @@ mod tests {
     #[tokio::test]
     async fn test_non_json_line_error_includes_line_number_and_content() {
         let index = make_index();
-        let result = read_file(&PathBuf::from("test_files/non-json.log"), &index, 0, None).await;
+        let wal = make_wal().await;
+        let result = read_file(
+            &PathBuf::from("test_files/non-json.log"),
+            &index,
+            0,
+            None,
+            &wal,
+        )
+        .await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("line 1"),

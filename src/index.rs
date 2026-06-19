@@ -23,7 +23,7 @@ pub enum AggregationError {
 }
 
 pub struct Index {
-    events: Vec<Event>,
+    pub events: Vec<Event>,
     field_index: HashMap<String, HashMap<Value, Vec<usize>>>,
     time_index: BTreeMap<DateTime<Utc>, Vec<usize>>,
 }

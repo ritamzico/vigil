@@ -7,20 +7,30 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::Duration;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
+use crate::recover::data_dir;
+use crate::recover::recover;
+
+mod checkpoint;
 mod event;
 mod handler;
 mod index;
 mod message;
 mod parser;
 mod query;
+mod recover;
 mod snapshot;
 mod tailer;
 mod value;
 mod wal;
+
+const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 struct Args {
@@ -91,12 +101,41 @@ async fn run_daemon(path: PathBuf, detach: bool, time_field: Option<String>) {
         };
     }
 
+    let mut resolved_dir = match data_dir(&file_path, None).await {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("Failed to resolve data directory: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let recovered = match recover(&resolved_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to recover persisted state: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let index = Arc::new(RwLock::new(recovered.index));
+    let mut wal = Arc::new(Mutex::new(recovered.wal));
+
     let listener = UnixListener::bind(message::SOCKET_PATH).unwrap();
-    let index = Arc::new(RwLock::new(index::Index::new()));
+
     let mut tailer_handle = tokio::spawn(tailer::run_tailer(
         file_path,
         index.clone(),
         time_field.clone(),
+        wal.clone(),
+        recovered.byte_offset,
+    ));
+    let mut flush_handle = tokio::spawn(checkpoint::run_flush_task(wal.clone(), FLUSH_INTERVAL));
+    let mut checkpoint_handle = tokio::spawn(checkpoint::run_checkpoint_task(
+        resolved_dir.clone(),
+        index.clone(),
+        wal.clone(),
+        time_field.clone(),
+        CHECKPOINT_INTERVAL,
     ));
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (watch_tx, mut watch_rx) = mpsc::channel::<(PathBuf, Option<String>)>(1);
@@ -107,6 +146,20 @@ async fn run_daemon(path: PathBuf, detach: bool, time_field: Option<String>) {
             result = &mut tailer_handle => {
                 if let Err(e) = result.unwrap() {
                     eprintln!("Tailer error: {e}");
+                    std::process::exit(1);
+                }
+                break;
+            }
+            result = &mut flush_handle => {
+                if let Err(e) = result.unwrap() {
+                    eprintln!("Flush task error: {e}");
+                    std::process::exit(1);
+                }
+                break;
+            }
+            result = &mut checkpoint_handle => {
+                if let Err(e) = result.unwrap() {
+                    eprintln!("Checkpoint task error: {e}");
                     std::process::exit(1);
                 }
                 break;
@@ -124,14 +177,64 @@ async fn run_daemon(path: PathBuf, detach: bool, time_field: Option<String>) {
                 }
             }
             _ = shutdown_rx.recv() => {
+                flush_handle.abort();
+                checkpoint_handle.abort();
+                let _ = flush_handle.await;
+                let _ = checkpoint_handle.await;
+
+                if let Err(e) = checkpoint::checkpoint(&resolved_dir, &index, &wal, &current_time_field).await {
+                    eprintln!("Final checkpoint failed: {e}");
+                }
                 break;
             }
             Some((new_path, new_time_field)) = watch_rx.recv() => {
                 tailer_handle.abort();
                 let _ = tailer_handle.await;
-                *index.write().unwrap() = index::Index::new();
+                flush_handle.abort();
+                checkpoint_handle.abort();
+                let _ = flush_handle.await;
+                let _ = checkpoint_handle.await;
+
+                if let Err(e) = checkpoint::checkpoint(&resolved_dir, &index, &wal, &current_time_field).await {
+                    eprintln!("Checkpoint before re-watch failed: {e}");
+                }
+
                 current_time_field = new_time_field.clone();
-                tailer_handle = tokio::spawn(tailer::run_tailer(new_path, index.clone(), new_time_field));
+
+                let new_data_dir = match data_dir(&new_path, None).await {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        eprintln!("Failed to resolve data directory for {}: {e}", new_path.display());
+                        std::process::exit(1);
+                    }
+                };
+                let new_recovered = match recover(&new_data_dir).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("Failed to recover persisted state for {}: {e}", new_path.display());
+                        std::process::exit(1);
+                    }
+                };
+
+                *index.write().unwrap() = new_recovered.index;
+                wal = Arc::new(Mutex::new(new_recovered.wal));
+                resolved_dir = new_data_dir;
+
+                tailer_handle = tokio::spawn(tailer::run_tailer(
+                    new_path,
+                    index.clone(),
+                    new_time_field,
+                    wal.clone(),
+                    new_recovered.byte_offset,
+                ));
+                flush_handle = tokio::spawn(checkpoint::run_flush_task(wal.clone(), FLUSH_INTERVAL));
+                checkpoint_handle = tokio::spawn(checkpoint::run_checkpoint_task(
+                    resolved_dir.clone(),
+                    index.clone(),
+                    wal.clone(),
+                    current_time_field.clone(),
+                    CHECKPOINT_INTERVAL,
+                ));
             }
         }
     }

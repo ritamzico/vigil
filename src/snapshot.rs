@@ -15,8 +15,8 @@ const BIN_FILE_NAME: &str = "snapshot.bin";
 pub struct Snapshot {
     schema_version: u32,
     time_field: Option<String>,
+    next_seq: u64,
     byte_offset: u64,
-    last_seq: u64,
     events: Vec<PersistedEvent>,
 }
 
@@ -25,16 +25,28 @@ impl Snapshot {
         schema_version: u32,
         time_field: Option<String>,
         byte_offset: u64,
-        last_seq: u64,
+        next_seq: u64,
         events: Vec<PersistedEvent>,
     ) -> Self {
         Snapshot {
             schema_version,
             time_field,
             byte_offset,
-            last_seq,
+            next_seq,
             events,
         }
+    }
+
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn byte_offset(&self) -> u64 {
+        self.byte_offset
+    }
+
+    pub fn into_events(self) -> Vec<PersistedEvent> {
+        self.events
     }
 
     pub async fn save(&self, dir: &Path) -> io::Result<()> {
