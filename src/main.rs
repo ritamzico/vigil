@@ -186,10 +186,15 @@ async fn run_daemon(
             }
             result = &mut checkpoint_handle => {
                 if let Err(e) = result.unwrap() {
-                    eprintln!("Checkpoint task error: {e}");
-                    std::process::exit(1);
+                    eprintln!("Checkpoint task error (continuing): {e}");
                 }
-                break;
+                checkpoint_handle = spawn_checkpoint_task(
+                    &resolved_dir,
+                    &index,
+                    &wal,
+                    &current_time_field,
+                    checkpoint_interval,
+                );
             }
             Ok((stream, _)) = listener.accept() => {
                 let client_handle = tokio::spawn(handler::handle_client(
@@ -281,7 +286,10 @@ async fn resolve_state(
     let recovered = match recover(&dir).await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to recover persisted state for {}: {e}", dir.display());
+            eprintln!(
+                "Failed to recover persisted state for {}: {e}",
+                dir.display()
+            );
             std::process::exit(1);
         }
     };
