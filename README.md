@@ -12,6 +12,8 @@ vigil "level = ERROR | p99 latency_ms"
 
 `vigil --watch` starts a daemon that tails the file and indexes every JSON log line into memory. It maintains a field index (for fast equality and comparison queries) and a time index (for time range queries). Queries are sent to the daemon over a Unix socket and return immediately from the index.
 
+To survive restarts, the daemon persists its progress with a **write-ahead log (WAL)** and periodic **snapshots** (see [Persistence & crash recovery](#persistence--crash-recovery)). On restart it reloads the last snapshot and replays the WAL instead of re-reading the whole file from the beginning.
+
 ## Installation
 
 ```
@@ -59,6 +61,46 @@ Queries are sent to the running daemon. Results are printed to stdout, one raw l
 
 ```
 vigil --stop
+```
+
+---
+
+## Persistence & crash recovery
+
+By default the daemon persists its index so a restart doesn't have to re-read and re-parse the entire log file. Two mechanisms work together:
+
+- **Write-ahead log (WAL).** Every indexed line is appended to `wal.log` and periodically fsync'd, so recently ingested events survive a crash.
+- **Snapshots.** Periodically (and on a graceful `--stop`) the full in-memory index is written to `snapshot.bin`, and the WAL is truncated.
+
+On startup the daemon loads the latest snapshot, replays any WAL records newer than the snapshot, and resumes tailing from where it left off — far faster than a cold re-scan for large files.
+
+Persisted state lives in a per-file data directory: `$HOME/.local/share/vigil/<hash>/` by default, where `<hash>` is derived from the watched file's absolute path (so each watched file gets its own snapshot/WAL).
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir <path>` | `$HOME/.local/share/vigil` | Base directory for snapshots and the WAL |
+| `--fsync-interval-ms <ms>` | `500` | How often the WAL is flushed and fsync'd to disk |
+| `--checkpoint-interval-secs <secs>` | `60` | How often a full snapshot is written and the WAL truncated |
+| `--no-persist` | off | Disable persistence entirely (pure in-memory; restart re-reads the file) |
+
+**Trade-offs.** A shorter `--fsync-interval-ms` narrows the window of events that could be lost on a hard crash, at the cost of more frequent disk I/O. A shorter `--checkpoint-interval-secs` keeps the WAL small and speeds crash recovery, at the cost of more frequent snapshot writes.
+
+**Examples:**
+
+```sh
+# Default persistence (snapshots every 60s, WAL fsync every 500ms)
+vigil --watch /var/log/app.log --time-field timestamp
+
+# Durable: fsync every 100ms, snapshot every 10s
+vigil --watch /var/log/app.log --fsync-interval-ms 100 --checkpoint-interval-secs 10
+
+# Custom data directory
+vigil --watch /var/log/app.log --data-dir /mnt/fast-ssd/vigil
+
+# Opt out of persistence
+vigil --watch /var/log/app.log --no-persist
 ```
 
 ---
@@ -173,8 +215,7 @@ Each line must be a flat JSON object. Scalar field types are indexed:
 
 ## Limitations
 
-- **In-memory only.** The entire log file is indexed in RAM. Not suited for very large files.
-- **No persistence.** Restarting the daemon re-reads the file from scratch.
+- **In-memory index.** The entire log file is indexed in RAM. Not suited for files larger than available memory.
 - **One file per daemon.** Each daemon instance watches a single file.
 - **No parentheses.** Complex boolean expressions use operator precedence (`AND` before `OR`) rather than grouping.
 - **Time range queries require `--time-field`.** Without it, the time field is treated as a regular string field.
