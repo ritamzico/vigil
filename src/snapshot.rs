@@ -4,12 +4,19 @@ use tokio::{
     fs::{rename, File},
     io::{self, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
 };
-use wincode::{deserialize, serialize, SchemaRead, SchemaWrite};
+use wincode::{
+    config::{deserialize, serialize, Configuration},
+    SchemaRead, SchemaWrite,
+};
 
 use crate::event::PersistedEvent;
 
 const TEMP_FILE_NAME: &str = "snapshot.tmp";
 const BIN_FILE_NAME: &str = "snapshot.bin";
+
+fn snapshot_config() -> Configuration<true, { usize::MAX }> {
+    Configuration::default().disable_preallocation_size_limit()
+}
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
 pub struct Snapshot {
@@ -41,7 +48,8 @@ impl Snapshot {
 
         let mut writer = BufWriter::new(temp_file);
 
-        let payload = serialize(self).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload = serialize(self, snapshot_config())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         writer.write_all(&payload).await?;
 
         writer.flush().await?;
@@ -65,8 +73,8 @@ impl Snapshot {
         let mut payload = vec![];
         reader.read_to_end(&mut payload).await?;
 
-        let snapshot =
-            deserialize(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let snapshot = deserialize(&payload, snapshot_config())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         Ok(Some(snapshot))
     }
@@ -108,6 +116,20 @@ mod tests {
     async fn test_save_and_load_empty_events() {
         let dir = tempdir().unwrap();
         let snapshot = make_snapshot(vec![]);
+
+        snapshot.save(dir.path()).await.unwrap();
+
+        let loaded = Snapshot::load(dir.path()).await.unwrap().unwrap();
+        assert_eq!(loaded, snapshot);
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_large_snapshot_exceeds_prealloc_cap() {
+        let dir = tempdir().unwrap();
+        let events: Vec<PersistedEvent> = (0..100_000)
+            .map(|i| make_event(&format!("log line number {i:08} with some padding payload")))
+            .collect();
+        let snapshot = make_snapshot(events);
 
         snapshot.save(dir.path()).await.unwrap();
 
