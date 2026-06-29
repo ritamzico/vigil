@@ -1,2 +1,8 @@
 /target
 /plans
+
+# Benchmark: track the harness (scripts/) and the report + graphs (bench/out/);
+# ignore rebuildable binaries and regenerable (seed 42) log data.
+/bench/bin
+/bench/logs
+/bench/data
