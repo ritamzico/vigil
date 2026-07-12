@@ -17,8 +17,34 @@ fn unexpected_token(tokens: &[&str], pos: usize) -> ParseError {
     IncorrectFormat(format!("unexpected token '{}'", tokens[pos]))
 }
 
+// Splits on whitespace, with '(' and ')' as their own tokens even when not
+// surrounded by spaces, e.g. "(a = 1)" -> ["(", "a", "=", "1", ")"].
+fn tokenize(query_string: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    for word in query_string.split_whitespace() {
+        let mut current = String::new();
+        for c in word.chars() {
+            if c == '(' || c == ')' {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                tokens.push(c.to_string());
+            } else {
+                current.push(c);
+            }
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+    }
+
+    tokens
+}
+
 pub fn parse_query(query_string: &str, time_field: Option<&str>) -> Result<QueryPlan, ParseError> {
-    let tokens: Vec<&str> = query_string.split_whitespace().collect();
+    let owned_tokens = tokenize(query_string);
+    let tokens: Vec<&str> = owned_tokens.iter().map(String::as_str).collect();
 
     if *tokens
         .get(0)
@@ -230,6 +256,21 @@ mod tests {
 
     fn parse_filter_with_time(s: &str) -> Result<Query, ParseError> {
         parse_query(s, Some("time")).map(|plan| plan.query.clone())
+    }
+
+    // --- Tokenizer ---
+
+    #[test]
+    fn test_tokenize_splits_parens() {
+        assert_eq!(
+            tokenize("(a = 1)"),
+            vec!["(", "a", "=", "1", ")"]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_plain_whitespace() {
+        assert_eq!(tokenize("status = 500"), vec!["status", "=", "500"]);
     }
 
     // --- Field comparisons ---

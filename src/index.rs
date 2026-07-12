@@ -78,45 +78,17 @@ impl Index {
         match aggregation {
             Aggregation::Count => Ok(QueryResult::Count(events.len())),
             Aggregation::Average(field) => {
-                if events.is_empty() {
-                    return Err(AggregationError::NoMatchingEvents);
-                }
-
-                let values: Vec<f32> = events
-                    .iter()
-                    .filter_map(|event| event.fields.get(field))
-                    .map(|value| match value {
-                        Value::Number(n) => Ok(*n),
-                        _ => Err(AggregationError::IncompatibleType(field.clone())),
-                    })
-                    .collect::<Result<_, _>>()?;
-
+                let values = numeric_values(&events, field)?;
                 let total: f32 = values.iter().sum();
-                let count = values.len();
 
-                if count == 0 {
-                    return Err(AggregationError::FieldNotFound(field.clone()));
-                }
-
-                Ok(QueryResult::Average(total / count as f32))
+                Ok(QueryResult::Average(total / values.len() as f32))
             }
             Aggregation::Percentage(field, p) => {
                 if *p <= 0.0 || *p > 1.0 {
                     return Err(AggregationError::InvalidPercentile);
                 }
 
-                if events.is_empty() {
-                    return Err(AggregationError::NoMatchingEvents);
-                }
-
-                let mut values: Vec<f32> = events
-                    .iter()
-                    .filter_map(|event| event.fields.get(field))
-                    .map(|value| match value {
-                        Value::Number(n) => Ok(*n),
-                        _ => Err(AggregationError::IncompatibleType(field.clone())),
-                    })
-                    .collect::<Result<Vec<f32>, _>>()?;
+                let mut values = numeric_values(&events, field)?;
 
                 values.sort_by(|a, b| a.total_cmp(b));
                 let i = (*p * values.len() as f32).ceil() as usize - 1;
@@ -134,58 +106,55 @@ impl Index {
     }
 
     pub fn apply_query<'a>(&'a self, query: &Query) -> Vec<&'a Event> {
-        match query {
-            Query::FieldComparison { .. } | Query::TimeRange { .. } => {
-                self.apply_simple_query(query)
-            }
-            Query::And(queries) => self.apply_and(&queries),
-            Query::Or(queries) => self.apply_or(&queries),
-            Query::All() => self.events.iter().collect(),
-        }
+        self.matching_indices(query)
+            .into_iter()
+            .map(|i| &self.events[i])
+            .collect()
     }
 
-    fn apply_simple_query<'a>(&'a self, query: &Query) -> Vec<&'a Event> {
+    /// Positions into `events` matching `query`, sorted and de-duplicated —
+    /// results are always in insertion (chronological) order.
+    pub fn matching_indices(&self, query: &Query) -> Vec<usize> {
+        let mut indices = self.collect_indices(query);
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    fn collect_indices(&self, query: &Query) -> Vec<usize> {
         match query {
             Query::FieldComparison { field, op, value } => {
-                self.apply_field_comparison(field, op, value)
+                self.field_comparison_indices(field, op, value)
             }
-            Query::TimeRange { start, end } => self.apply_time_range(start, end),
-            _ => panic!("Unknown Query variant"),
+            Query::TimeRange { start, end } => self.time_range_indices(start, end),
+            Query::And(queries) => self.and_indices(queries),
+            Query::Or(queries) => self.or_indices(queries),
+            Query::All() => (0..self.events.len()).collect(),
         }
     }
 
-    fn apply_field_comparison(
+    fn field_comparison_indices(
         &self,
         field: &String,
         op: &ComparisonOp,
         value: &Value,
-    ) -> Vec<&Event> {
+    ) -> Vec<usize> {
         let Some(field_map) = self.field_index.get(field) else {
             return vec![];
         };
 
-        let filter_field = |candidate: &Value| match *op {
-            ComparisonOp::Eq => candidate == value,
-            ComparisonOp::Ne => candidate != value,
-            ComparisonOp::Lt => candidate < value,
-            ComparisonOp::Le => candidate <= value,
-            ComparisonOp::Gt => candidate > value,
-            ComparisonOp::Ge => candidate >= value,
-        };
-
         field_map
             .iter()
-            .filter(|(candidate, _)| filter_field(candidate))
-            .flat_map(|(_, indices)| indices.iter())
-            .map(|&i| &self.events[i])
+            .filter(|(candidate, _)| compare(op, candidate, value))
+            .flat_map(|(_, indices)| indices.iter().copied())
             .collect()
     }
 
-    fn apply_time_range(
+    fn time_range_indices(
         &self,
         start: &Option<DateTime<Utc>>,
         end: &Option<DateTime<Utc>>,
-    ) -> Vec<&Event> {
+    ) -> Vec<usize> {
         let range = (
             match start {
                 Some(s) => Included(s),
@@ -199,18 +168,17 @@ impl Index {
 
         self.time_index
             .range(range)
-            .flat_map(|(_, indices)| indices.iter())
-            .map(|&i| &self.events[i])
+            .flat_map(|(_, indices)| indices.iter().copied())
             .collect()
     }
 
-    fn apply_and<'a>(&'a self, queries: &Vec<Query>) -> Vec<&'a Event> {
-        let all_events: Vec<Vec<&Event>> = queries
+    fn and_indices(&self, queries: &[Query]) -> Vec<usize> {
+        let all_indices: Vec<Vec<usize>> = queries
             .par_iter()
-            .map(|query| self.apply_simple_query(query))
+            .map(|query| self.collect_indices(query))
             .collect();
 
-        let sets: Vec<HashSet<&Event>> = all_events
+        let sets: Vec<HashSet<usize>> = all_indices
             .iter()
             .map(|v| v.iter().copied().collect())
             .collect();
@@ -218,24 +186,50 @@ impl Index {
 
         first
             .iter()
-            .filter(|item| sets[1..].iter().all(|s| s.contains(*item)))
-            .map(|item| *item)
+            .copied()
+            .filter(|i| sets[1..].iter().all(|s| s.contains(i)))
             .collect()
     }
 
-    fn apply_or<'a>(&'a self, queries: &Vec<Query>) -> Vec<&'a Event> {
-        let all_events: Vec<Vec<&Event>> = queries
+    fn or_indices(&self, queries: &[Query]) -> Vec<usize> {
+        queries
             .par_iter()
-            .map(|query| self.apply_simple_query(query))
-            .collect();
-
-        all_events
-            .into_iter()
+            .map(|query| self.collect_indices(query))
             .flatten()
-            .collect::<HashSet<&Event>>()
-            .into_iter()
             .collect()
     }
+}
+
+pub fn compare(op: &ComparisonOp, candidate: &Value, value: &Value) -> bool {
+    match *op {
+        ComparisonOp::Eq => candidate == value,
+        ComparisonOp::Ne => candidate != value,
+        ComparisonOp::Lt => candidate < value,
+        ComparisonOp::Le => candidate <= value,
+        ComparisonOp::Gt => candidate > value,
+        ComparisonOp::Ge => candidate >= value,
+    }
+}
+
+fn numeric_values(events: &[&Event], field: &str) -> Result<Vec<f32>, AggregationError> {
+    if events.is_empty() {
+        return Err(AggregationError::NoMatchingEvents);
+    }
+
+    let values: Vec<f32> = events
+        .iter()
+        .filter_map(|event| event.fields.get(field))
+        .map(|value| match value {
+            Value::Number(n) => Ok(*n),
+            _ => Err(AggregationError::IncompatibleType(field.to_string())),
+        })
+        .collect::<Result<_, _>>()?;
+
+    if values.is_empty() {
+        return Err(AggregationError::FieldNotFound(field.to_string()));
+    }
+
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -749,6 +743,78 @@ mod tests {
             },
         ]);
         assert_eq!(result_count(idx.apply_query(&q)), 2);
+    }
+
+    // --- Ordering & matching_indices ---
+
+    #[test]
+    fn test_results_in_insertion_order() {
+        let mut idx = Index::new();
+        for (raw, level) in [
+            ("e1", "error"),
+            ("e2", "info"),
+            ("e3", "error"),
+            ("e4", "info"),
+            ("e5", "error"),
+        ] {
+            idx.push_event(make_event_raw(raw, vec![("level", Value::String(level.into()))]));
+        }
+
+        let q = Query::FieldComparison {
+            field: "level".into(),
+            op: ComparisonOp::Ne,
+            value: Value::String("info".into()),
+        };
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e1", "e3", "e5"]);
+    }
+
+    #[test]
+    fn test_or_containing_and() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![
+                ("a", Value::Number(1.0)),
+                ("b", Value::Number(2.0)),
+            ],
+        ));
+        idx.push_event(make_event_raw("e2", vec![("c", Value::Number(3.0))]));
+        idx.push_event(make_event_raw("e3", vec![("a", Value::Number(1.0))]));
+
+        // a = 1 AND b = 2 OR c = 3
+        let q = Query::Or(vec![
+            Query::And(vec![
+                eq("a", Value::Number(1.0)),
+                eq("b", Value::Number(2.0)),
+            ]),
+            eq("c", Value::Number(3.0)),
+        ]);
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e1", "e2"]);
+    }
+
+    #[test]
+    fn test_matching_indices_sorted_deduped() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![
+                ("level", Value::String("error".into())),
+                ("service", Value::String("auth".into())),
+            ],
+        ));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![("level", Value::String("error".into()))],
+        ));
+
+        // e1 matches both arms of the OR — must appear once
+        let q = Query::Or(vec![
+            eq("level", Value::String("error".into())),
+            eq("service", Value::String("auth".into())),
+        ]);
+        assert_eq!(idx.matching_indices(&q), vec![0, 1]);
     }
 
     // --- Aggregations ---
