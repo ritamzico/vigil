@@ -218,14 +218,20 @@ fn parse_field_comparison(tokens: &[&str], pos: usize) -> Result<(Query, usize),
         "<=" => ComparisonOp::Le,
         ">" => ComparisonOp::Gt,
         ">=" => ComparisonOp::Ge,
+        "~" => ComparisonOp::Contains,
         op => return Err(UnknownOperator(String::from(op))),
     };
 
-    let value = Value::from_string(
-        tokens
-            .get(pos + 2)
-            .ok_or_else(|| IncorrectFormat(String::from("expected value")))?,
-    );
+    let value_token = tokens
+        .get(pos + 2)
+        .ok_or_else(|| IncorrectFormat(String::from("expected value")))?;
+
+    // Substring search is always over strings — don't auto-type the value.
+    let value = if op == ComparisonOp::Contains {
+        Value::String(value_token.to_string())
+    } else {
+        Value::from_string(value_token)
+    };
 
     Ok((Query::FieldComparison { field, op, value }, pos + 3))
 }
@@ -365,6 +371,31 @@ mod tests {
         assert_eq!(
             parse_filter("latency_ms >= 500"),
             Ok(field("latency_ms", ComparisonOp::Ge, Value::Number(500.0)))
+        );
+    }
+
+    #[test]
+    fn test_field_contains() {
+        assert_eq!(
+            parse_filter("message ~ timeout"),
+            Ok(field(
+                "message",
+                ComparisonOp::Contains,
+                Value::String("timeout".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn test_field_contains_numeric_token_stays_string() {
+        // '~' always searches string values, so the term is not auto-typed.
+        assert_eq!(
+            parse_filter("message ~ 500"),
+            Ok(field(
+                "message",
+                ComparisonOp::Contains,
+                Value::String("500".into())
+            ))
         );
     }
 

@@ -129,15 +129,19 @@ A query is a filter expression, optionally followed by an aggregation using `|`.
 | `<=` | less than or equal |
 | `>` | greater than |
 | `>=` | greater than or equal |
+| `~` | contains substring (string fields only) |
 
-Values are automatically typed: `500` is a number, `true`/`false` are booleans, anything else is a string.
+Values are automatically typed: `500` is a number, `true`/`false` are booleans, anything else is a string. The `~` search term is always treated as a string, and it only matches string fields.
 
 ```
 status = 500
 level = ERROR
 latency_ms > 1000
 active != true
+message ~ timeout
 ```
+
+`~` matches a literal substring only — the search term can't contain spaces (queries are tokenized on whitespace), and there is no regex support. A regex operator (`=~`, backed by the `regex` crate) is a possible future extension.
 
 #### Boolean logic
 

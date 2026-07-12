@@ -170,6 +170,19 @@ fn test_not_and_paren_query() {
     let out = daemon.query("NOT status = 500 | count");
     assert!(out.status.success());
     assert_eq!(stdout(&out), "2");
+fn test_contains_query() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"message":"connection timeout after 30s"}"#,
+        r#"{"message":"request ok"}"#,
+    ]);
+
+    let out = daemon.query("message ~ timeout");
+
+    assert!(out.status.success());
+    let body = stdout(&out);
+    assert_eq!(body.lines().count(), 1);
+    assert!(body.contains("timeout"));
 }
 
 // --- Aggregations ---
