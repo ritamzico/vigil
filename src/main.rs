@@ -147,6 +147,24 @@ async fn run_daemon(
     let index = Arc::new(RwLock::new(index_inner));
     let mut wal: Option<Arc<Mutex<WAL>>> = wal_inner.map(|w| Arc::new(Mutex::new(w)));
 
+    // Ingest the file's existing contents before accepting queries, so a client
+    // that connects the instant the socket appears never sees a partial index.
+    let byte_offset = match tailer::initial_read(
+        &file_path,
+        &index,
+        time_field.as_deref(),
+        &wal,
+        byte_offset,
+    )
+    .await
+    {
+        Ok(offset) => offset,
+        Err(e) => {
+            eprintln!("Tailer error: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let listener = UnixListener::bind(message::SOCKET_PATH).unwrap();
 
     let mut tailer_handle = tokio::spawn(tailer::run_tailer(
