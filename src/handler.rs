@@ -33,9 +33,9 @@ pub async fn handle_client(
         from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let response: Message;
 
-    match message.get_message_kind() {
+    match message.message_kind {
         MessageKind::Query => {
-            response = match parse_query(message.get_message_data(), time_field.as_deref()) {
+            response = match parse_query(&message.data, time_field.as_deref()) {
                 Err(e) => Message::new(MessageKind::QueryError, e.to_string()),
                 Ok(query_plan) => {
                     let index_guard = index.read().unwrap();
@@ -51,7 +51,7 @@ pub async fn handle_client(
             let _ = shutdown_tx.send(()).await;
         }
         MessageKind::Watch => {
-            let payload: WatchPayload = serde_json::from_str(message.get_message_data())
+            let payload: WatchPayload = serde_json::from_str(&message.data)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let _ = watch_tx.send((payload.path, payload.time_field)).await;
             response = Message::new(MessageKind::WatchAck, String::new());
@@ -120,8 +120,8 @@ mod tests {
 
         let (response, _) = roundtrip(index, Message::new(MessageKind::Query, "level = ERROR".into())).await;
 
-        assert!(matches!(response.get_message_kind(), MessageKind::QueryResponse));
-        assert_eq!(response.get_message_data(), "e1");
+        assert!(matches!(response.message_kind, MessageKind::QueryResponse));
+        assert_eq!(response.data, "e1");
     }
 
     #[tokio::test]
@@ -130,8 +130,8 @@ mod tests {
 
         let (response, _) = roundtrip(index, Message::new(MessageKind::Query, "level = ERROR".into())).await;
 
-        assert!(matches!(response.get_message_kind(), MessageKind::QueryResponse));
-        assert!(response.get_message_data().is_empty());
+        assert!(matches!(response.message_kind, MessageKind::QueryResponse));
+        assert!(response.data.is_empty());
     }
 
     #[tokio::test]
@@ -140,7 +140,7 @@ mod tests {
 
         let (response, _) = roundtrip(index, Message::new(MessageKind::Query, "level ???".into())).await;
 
-        assert!(matches!(response.get_message_kind(), MessageKind::QueryError));
+        assert!(matches!(response.message_kind, MessageKind::QueryError));
     }
 
     #[tokio::test]
@@ -151,7 +151,7 @@ mod tests {
 
         let (response, _) = roundtrip(index, Message::new(MessageKind::Query, "status = 500 | avg latency_ms".into())).await;
 
-        assert!(matches!(response.get_message_kind(), MessageKind::QueryError));
+        assert!(matches!(response.message_kind, MessageKind::QueryError));
     }
 
     #[tokio::test]
@@ -164,8 +164,8 @@ mod tests {
 
         let (response, _) = roundtrip(index, Message::new(MessageKind::Query, "status = 500 | count".into())).await;
 
-        assert!(matches!(response.get_message_kind(), MessageKind::QueryResponse));
-        assert_eq!(response.get_message_data(), "2");
+        assert!(matches!(response.message_kind, MessageKind::QueryResponse));
+        assert_eq!(response.data, "2");
     }
 
     #[tokio::test]
@@ -174,7 +174,7 @@ mod tests {
 
         let (response, mut shutdown_rx) = roundtrip(index, Message::new(MessageKind::Shutdown, String::new())).await;
 
-        assert!(matches!(response.get_message_kind(), MessageKind::ShutdownAck));
+        assert!(matches!(response.message_kind, MessageKind::ShutdownAck));
         assert!(shutdown_rx.try_recv().is_ok());
     }
 }

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
+use tempfile::TempDir;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_vigil");
 const SOCKET: &str = "/tmp/vigil.sock";
@@ -12,6 +13,10 @@ static LOCK: Mutex<()> = Mutex::new(());
 
 struct Daemon {
     log_file: PathBuf,
+    // Held for its Drop side effect (directory cleanup); each test gets its
+    // own isolated --data-dir so daemon restarts across tests never recover
+    // a previous test's persisted state.
+    _data_dir: TempDir,
 }
 
 impl Daemon {
@@ -30,8 +35,13 @@ impl Daemon {
             writeln!(f, "{}", event).unwrap();
         }
 
+        let data_dir = TempDir::new().unwrap();
+
         let mut cmd = Command::new(BINARY);
-        cmd.arg("--watch").arg(&log_path);
+        cmd.arg("--watch")
+            .arg(&log_path)
+            .arg("--data-dir")
+            .arg(data_dir.path());
         if let Some(tf) = time_field {
             cmd.arg("--time-field").arg(tf);
         }
@@ -43,7 +53,10 @@ impl Daemon {
 
         for _ in 0..50 {
             if Path::new(SOCKET).exists() {
-                return Daemon { log_file: log_path };
+                return Daemon {
+                    log_file: log_path,
+                    _data_dir: data_dir,
+                };
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -267,6 +280,7 @@ fn test_stop_shuts_down_daemon_and_removes_socket() {
 
     let log_path = std::env::temp_dir().join("vigil_integration_test.log");
     std::fs::File::create(&log_path).unwrap();
+    let data_dir = TempDir::new().unwrap();
 
     let _ = Command::new(BINARY).arg("--stop").output();
     std::thread::sleep(Duration::from_millis(100));
@@ -274,6 +288,8 @@ fn test_stop_shuts_down_daemon_and_removes_socket() {
     Command::new(BINARY)
         .arg("--watch")
         .arg(&log_path)
+        .arg("--data-dir")
+        .arg(data_dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
