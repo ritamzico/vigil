@@ -12,6 +12,7 @@ pub enum ComparisonOp {
     Le,
     Gt,
     Ge,
+    Contains,
 }
 
 #[derive(Debug, PartialEq, Clone)]
