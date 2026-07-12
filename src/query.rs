@@ -28,6 +28,7 @@ pub enum Query {
     },
     And(Vec<Query>),
     Or(Vec<Query>),
+    Not(Box<Query>),
     All(),
 }
 

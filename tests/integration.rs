@@ -154,6 +154,24 @@ fn test_or_query() {
 }
 
 #[test]
+fn test_not_and_paren_query() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"level":"ERROR","status":500}"#,
+        r#"{"level":"WARN","status":503}"#,
+        r#"{"level":"ERROR","status":200}"#,
+        r#"{"level":"INFO","status":500}"#,
+    ]);
+
+    let out = daemon.query("(level = ERROR OR level = WARN) AND status >= 500");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out).lines().count(), 2);
+
+    let out = daemon.query("NOT status = 500 | count");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "2");
+}
+
 fn test_contains_query() {
     let _lock = LOCK.lock().unwrap();
     let daemon = Daemon::start(&[
@@ -239,9 +257,7 @@ fn test_time_range_requires_time_field_flag() {
     let _lock = LOCK.lock().unwrap();
     // Daemon started without --time-field: "ts" is just a regular string field,
     // so the time range query returns no results.
-    let daemon = Daemon::start(&[
-        r#"{"ts":"2026-01-01T00:00:00Z","level":"ERROR"}"#,
-    ]);
+    let daemon = Daemon::start(&[r#"{"ts":"2026-01-01T00:00:00Z","level":"ERROR"}"#]);
 
     let out = daemon.query("ts > 2026-03-01T00:00:00Z | count");
     assert!(out.status.success());
@@ -325,7 +341,10 @@ fn test_stop_shuts_down_daemon_and_removes_socket() {
     assert_eq!(stdout(&out), "Daemon stopped.");
 
     std::thread::sleep(Duration::from_millis(200));
-    assert!(!Path::new(SOCKET).exists(), "Socket file should be removed after stop");
+    assert!(
+        !Path::new(SOCKET).exists(),
+        "Socket file should be removed after stop"
+    );
 
     std::fs::remove_file(&log_path).ok();
 }
