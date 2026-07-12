@@ -181,12 +181,18 @@ Append `| <aggregation>` to a filter to compute a result instead of returning ra
 | `count` | Number of matching events |
 | `count by <field>` | Number of matching events that have `<field>` |
 | `avg <field>` | Average of `<field>` across matching events |
+| `sum <field>` | Sum of `<field>` across matching events |
+| `min <field>` | Minimum of `<field>` across matching events |
+| `max <field>` | Maximum of `<field>` across matching events |
 | `p<N> <field>` | Nth percentile of `<field>` (N is 1–100) |
 
 ```
 level = ERROR | count
 level = ERROR | count by request_id
 status >= 500 | avg latency_ms
+status >= 500 | sum latency_ms
+status >= 500 | min latency_ms
+status >= 500 | max latency_ms
 status >= 500 | p99 latency_ms
 status >= 500 | p50 latency_ms
 | count

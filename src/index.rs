@@ -81,7 +81,7 @@ impl Index {
                 let values = numeric_values(&events, field)?;
                 let total: f32 = values.iter().sum();
 
-                Ok(QueryResult::Average(total / values.len() as f32))
+                Ok(QueryResult::Scalar(total / values.len() as f32))
             }
             Aggregation::Percentage(field, p) => {
                 if *p <= 0.0 || *p > 1.0 {
@@ -93,7 +93,33 @@ impl Index {
                 values.sort_by(|a, b| a.total_cmp(b));
                 let i = (*p * values.len() as f32).ceil() as usize - 1;
 
-                Ok(QueryResult::Percentage(values[i]))
+                Ok(QueryResult::Scalar(values[i]))
+            }
+            Aggregation::Sum(field) => {
+                let values = numeric_values(&events, field)?;
+
+                Ok(QueryResult::Scalar(values.iter().sum()))
+            }
+            Aggregation::Min(field) => {
+                let values = numeric_values(&events, field)?;
+
+                // numeric_values guarantees at least one value
+                Ok(QueryResult::Scalar(
+                    values
+                        .into_iter()
+                        .reduce(|a, b| if b.total_cmp(&a).is_lt() { b } else { a })
+                        .unwrap(),
+                ))
+            }
+            Aggregation::Max(field) => {
+                let values = numeric_values(&events, field)?;
+
+                Ok(QueryResult::Scalar(
+                    values
+                        .into_iter()
+                        .reduce(|a, b| if b.total_cmp(&a).is_gt() { b } else { a })
+                        .unwrap(),
+                ))
             }
             Aggregation::CountBy(field) => Ok(QueryResult::CountBy(
                 events
@@ -877,7 +903,7 @@ mod tests {
         );
         assert_eq!(
             idx.apply_query_plan(&plan).unwrap(),
-            QueryResult::Average(200.0)
+            QueryResult::Scalar(200.0)
         );
     }
 
@@ -905,7 +931,7 @@ mod tests {
         // average of 100 and 300 only, e3 skipped
         assert_eq!(
             idx.apply_query_plan(&plan).unwrap(),
-            QueryResult::Average(200.0)
+            QueryResult::Scalar(200.0)
         );
     }
 
@@ -965,6 +991,155 @@ mod tests {
         let plan = make_plan(
             eq("active", Value::Bool(true)),
             Some(Aggregation::Average("active".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::IncompatibleType(_))
+        ));
+    }
+
+    fn latency_index() -> Index {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("latency", Value::Number(100.0))],
+        ));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![("latency", Value::Number(300.0))],
+        ));
+        idx.push_event(make_event_raw(
+            "e3",
+            vec![("latency", Value::Number(200.0))],
+        ));
+        idx
+    }
+
+    #[test]
+    fn test_sum_basic() {
+        let idx = latency_index();
+
+        let plan = make_plan(Query::All(), Some(Aggregation::Sum("latency".into())));
+        assert_eq!(
+            idx.apply_query_plan(&plan).unwrap(),
+            QueryResult::Scalar(600.0)
+        );
+    }
+
+    #[test]
+    fn test_min_basic() {
+        let idx = latency_index();
+
+        let plan = make_plan(Query::All(), Some(Aggregation::Min("latency".into())));
+        assert_eq!(
+            idx.apply_query_plan(&plan).unwrap(),
+            QueryResult::Scalar(100.0)
+        );
+    }
+
+    #[test]
+    fn test_max_basic() {
+        let idx = latency_index();
+
+        let plan = make_plan(Query::All(), Some(Aggregation::Max("latency".into())));
+        assert_eq!(
+            idx.apply_query_plan(&plan).unwrap(),
+            QueryResult::Scalar(300.0)
+        );
+    }
+
+    #[test]
+    fn test_sum_error_no_matching_events() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+
+        let plan = make_plan(
+            eq("status", Value::Number(500.0)),
+            Some(Aggregation::Sum("latency".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::NoMatchingEvents)
+        ));
+    }
+
+    #[test]
+    fn test_min_error_no_matching_events() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+
+        let plan = make_plan(
+            eq("status", Value::Number(500.0)),
+            Some(Aggregation::Min("latency".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::NoMatchingEvents)
+        ));
+    }
+
+    #[test]
+    fn test_max_error_no_matching_events() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+
+        let plan = make_plan(
+            eq("status", Value::Number(500.0)),
+            Some(Aggregation::Max("latency".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::NoMatchingEvents)
+        ));
+    }
+
+    #[test]
+    fn test_sum_error_incompatible_type() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("level", Value::String("ERROR".into()))],
+        ));
+
+        let plan = make_plan(
+            eq("level", Value::String("ERROR".into())),
+            Some(Aggregation::Sum("level".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::IncompatibleType(_))
+        ));
+    }
+
+    #[test]
+    fn test_min_error_incompatible_type() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("level", Value::String("ERROR".into()))],
+        ));
+
+        let plan = make_plan(
+            eq("level", Value::String("ERROR".into())),
+            Some(Aggregation::Min("level".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::IncompatibleType(_))
+        ));
+    }
+
+    #[test]
+    fn test_max_error_incompatible_type() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("level", Value::String("ERROR".into()))],
+        ));
+
+        let plan = make_plan(
+            eq("level", Value::String("ERROR".into())),
+            Some(Aggregation::Max("level".into())),
         );
         assert!(matches!(
             idx.apply_query_plan(&plan),
