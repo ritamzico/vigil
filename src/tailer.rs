@@ -17,6 +17,19 @@ use tokio::time::{sleep, Duration};
 
 const SLEEP_TIME: u64 = 100;
 
+/// Read everything already in the file once, returning the resulting byte
+/// offset. Callers run this before opening the query socket so clients never
+/// observe a half-loaded index.
+pub async fn initial_read(
+    file_path: &PathBuf,
+    index: &Arc<RwLock<Index>>,
+    time_field: Option<&str>,
+    wal: &Option<Arc<Mutex<WAL>>>,
+    starting_byte_offset: u64,
+) -> Result<u64, io::Error> {
+    read_file(file_path, index, starting_byte_offset, time_field, wal).await
+}
+
 pub async fn run_tailer(
     file_path: PathBuf,
     index: Arc<RwLock<Index>>,
