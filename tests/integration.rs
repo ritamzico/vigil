@@ -275,6 +275,25 @@ fn test_time_range_query() {
 }
 
 #[test]
+fn test_relative_time_range_query() {
+    let _lock = LOCK.lock().unwrap();
+    let now = chrono::Utc::now();
+    let recent = (now - chrono::Duration::minutes(5)).to_rfc3339();
+    let old = (now - chrono::Duration::hours(2)).to_rfc3339();
+    let daemon = Daemon::start_with_time_field(
+        &[
+            &format!(r#"{{"ts":"{}","level":"ERROR"}}"#, old),
+            &format!(r#"{{"ts":"{}","level":"ERROR"}}"#, recent),
+        ],
+        Some("ts"),
+    );
+
+    let out = daemon.query("ts > -1h | count");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "1");
+}
+
+#[test]
 fn test_time_range_requires_time_field_flag() {
     let _lock = LOCK.lock().unwrap();
     // Daemon started without --time-field: "ts" is just a regular string field,
