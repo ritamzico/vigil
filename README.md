@@ -141,13 +141,18 @@ active != true
 
 #### Boolean logic
 
-Use `AND` and `OR` to combine filters. `AND` binds tighter than `OR`.
+Use `AND`, `OR`, and `NOT` to combine filters, and parentheses to group. `NOT` binds tighter than `AND`, which binds tighter than `OR`.
 
 ```
 status = 500 AND level = ERROR
 status = 500 OR status = 503
 level = ERROR AND method = POST OR level = WARN AND status >= 400
+NOT status = 500
+status = 500 AND NOT level = INFO
+(level = ERROR OR level = WARN) AND status >= 500
 ```
+
+`NOT` matches every event the inner filter does not — including events that lack the field entirely.
 
 #### Time range
 
@@ -217,5 +222,4 @@ Each line must be a flat JSON object. Scalar field types are indexed:
 
 - **In-memory index.** The entire log file is indexed in RAM. Not suited for files larger than available memory.
 - **One file per daemon.** Each daemon instance watches a single file.
-- **No parentheses.** Complex boolean expressions use operator precedence (`AND` before `OR`) rather than grouping.
 - **Time range queries require `--time-field`.** Without it, the time field is treated as a regular string field.

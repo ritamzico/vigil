@@ -129,6 +129,7 @@ impl Index {
             Query::TimeRange { start, end } => self.time_range_indices(start, end),
             Query::And(queries) => self.and_indices(queries),
             Query::Or(queries) => self.or_indices(queries),
+            Query::Not(query) => self.not_indices(query),
             Query::All() => (0..self.events.len()).collect(),
         }
     }
@@ -188,6 +189,14 @@ impl Index {
             .iter()
             .copied()
             .filter(|i| sets[1..].iter().all(|s| s.contains(i)))
+            .collect()
+    }
+
+    fn not_indices(&self, query: &Query) -> Vec<usize> {
+        let matched: HashSet<usize> = self.collect_indices(query).into_iter().collect();
+
+        (0..self.events.len())
+            .filter(|i| !matched.contains(i))
             .collect()
     }
 
@@ -743,6 +752,77 @@ mod tests {
             },
         ]);
         assert_eq!(result_count(idx.apply_query(&q)), 2);
+    }
+
+    // --- Not ---
+
+    #[test]
+    fn test_not_excludes_matches() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
+        idx.push_event(make_event_raw("e2", vec![("status", Value::Number(200.0))]));
+        idx.push_event(make_event_raw("e3", vec![("status", Value::Number(500.0))]));
+
+        // NOT status = 500
+        let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e2"]);
+    }
+
+    #[test]
+    fn test_not_includes_events_missing_field() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
+        idx.push_event(make_event_raw("e2", vec![("level", Value::String("info".into()))]));
+
+        // The complement is over all events, so events without the field match too.
+        let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e2"]);
+    }
+
+    #[test]
+    fn test_not_no_matches_returns_all() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+        idx.push_event(make_event_raw("e2", vec![("status", Value::Number(404.0))]));
+
+        let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
+        assert_eq!(result_count(idx.apply_query(&q)), 2);
+    }
+
+    #[test]
+    fn test_and_with_not() {
+        let mut idx = Index::new();
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![
+                ("status", Value::Number(500.0)),
+                ("level", Value::String("info".into())),
+            ],
+        ));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![
+                ("status", Value::Number(500.0)),
+                ("level", Value::String("error".into())),
+            ],
+        ));
+        idx.push_event(make_event_raw(
+            "e3",
+            vec![
+                ("status", Value::Number(200.0)),
+                ("level", Value::String("error".into())),
+            ],
+        ));
+
+        // status = 500 AND NOT level = info
+        let q = Query::And(vec![
+            eq("status", Value::Number(500.0)),
+            Query::Not(Box::new(eq("level", Value::String("info".into())))),
+        ]);
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e2"]);
     }
 
     // --- Ordering & matching_indices ---

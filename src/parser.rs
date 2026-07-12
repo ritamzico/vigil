@@ -146,13 +146,13 @@ fn parse_or(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Qu
     }
 }
 
-// and_expr = simple_expr ("AND" simple_expr)*
+// and_expr = not_expr ("AND" not_expr)*
 fn parse_and(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Query, usize), ParseError> {
-    let (first, mut pos) = parse_simple(tokens, pos, time_field)?;
+    let (first, mut pos) = parse_not(tokens, pos, time_field)?;
     let mut parts = vec![first];
 
     while tokens.get(pos) == Some(&"AND") {
-        let (next, new_pos) = parse_simple(tokens, pos + 1, time_field)?;
+        let (next, new_pos) = parse_not(tokens, pos + 1, time_field)?;
         parts.push(next);
         pos = new_pos;
     }
@@ -161,6 +161,31 @@ fn parse_and(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Q
         Ok((parts.remove(0), pos))
     } else {
         Ok((Query::And(parts), pos))
+    }
+}
+
+// not_expr = "NOT"? primary
+fn parse_not(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Query, usize), ParseError> {
+    if tokens.get(pos) == Some(&"NOT") {
+        let (query, pos) = parse_primary(tokens, pos + 1, time_field)?;
+        Ok((Query::Not(Box::new(query)), pos))
+    } else {
+        parse_primary(tokens, pos, time_field)
+    }
+}
+
+// primary = "(" or_expr ")" | simple_expr
+fn parse_primary(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Query, usize), ParseError> {
+    if tokens.get(pos) == Some(&"(") {
+        let (query, pos) = parse_or(tokens, pos + 1, time_field)?;
+
+        if tokens.get(pos) != Some(&")") {
+            return Err(IncorrectFormat(String::from("expected ')'")));
+        }
+
+        Ok((query, pos + 1))
+    } else {
+        parse_simple(tokens, pos, time_field)
     }
 }
 
@@ -485,6 +510,90 @@ mod tests {
         );
     }
 
+    // --- NOT ---
+
+    #[test]
+    fn test_not_simple() {
+        assert_eq!(
+            parse_filter("NOT status = 500"),
+            Ok(Query::Not(Box::new(field(
+                "status",
+                ComparisonOp::Eq,
+                Value::Number(500.0)
+            ))))
+        );
+    }
+
+    #[test]
+    fn test_and_with_not() {
+        // NOT binds tighter than AND
+        assert_eq!(
+            parse_filter("status = 500 AND NOT level = INFO"),
+            Ok(Query::And(vec![
+                field("status", ComparisonOp::Eq, Value::Number(500.0)),
+                Query::Not(Box::new(field(
+                    "level",
+                    ComparisonOp::Eq,
+                    Value::String("INFO".into())
+                ))),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_not_paren_group() {
+        assert_eq!(
+            parse_filter("NOT (a = 1 OR b = 2)"),
+            Ok(Query::Not(Box::new(Query::Or(vec![
+                field("a", ComparisonOp::Eq, Value::Number(1.0)),
+                field("b", ComparisonOp::Eq, Value::Number(2.0)),
+            ]))))
+        );
+    }
+
+    // --- Parentheses ---
+
+    #[test]
+    fn test_paren_overrides_precedence() {
+        // (a=1 OR b=2) AND c=3  =>  AND[OR[a=1, b=2], c=3]
+        assert_eq!(
+            parse_filter("(a = 1 OR b = 2) AND c = 3"),
+            Ok(Query::And(vec![
+                Query::Or(vec![
+                    field("a", ComparisonOp::Eq, Value::Number(1.0)),
+                    field("b", ComparisonOp::Eq, Value::Number(2.0)),
+                ]),
+                field("c", ComparisonOp::Eq, Value::Number(3.0)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_paren_around_simple_expr() {
+        assert_eq!(
+            parse_filter("(status = 500)"),
+            Ok(field("status", ComparisonOp::Eq, Value::Number(500.0)))
+        );
+    }
+
+    #[test]
+    fn test_nested_parens() {
+        // ((a=1 OR b=2) AND c=3) OR d=4
+        assert_eq!(
+            parse_filter("((a = 1 OR b = 2) AND c = 3) OR d = 4"),
+            Ok(Query::Or(vec![
+                Query::And(vec![
+                    Query::Or(vec![
+                        field("a", ComparisonOp::Eq, Value::Number(1.0)),
+                        field("b", ComparisonOp::Eq, Value::Number(2.0)),
+                    ]),
+                    field("c", ComparisonOp::Eq, Value::Number(3.0)),
+                ]),
+                field("d", ComparisonOp::Eq, Value::Number(4.0)),
+            ]))
+        );
+    }
+
     // --- Errors ---
 
     #[test]
@@ -539,6 +648,38 @@ mod tests {
     fn test_error_trailing_or() {
         assert!(matches!(
             parse_query("status = 500 OR", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_unclosed_paren() {
+        assert!(matches!(
+            parse_query("(a = 1 OR b = 2", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_stray_close_paren() {
+        assert!(matches!(
+            parse_query("a = 1)", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_empty_parens() {
+        assert!(matches!(
+            parse_query("()", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_not_without_operand() {
+        assert!(matches!(
+            parse_query("NOT", None),
             Err(ParseError::IncorrectFormat(_))
         ));
     }

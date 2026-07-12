@@ -153,6 +153,25 @@ fn test_or_query() {
     assert_eq!(stdout(&out).lines().count(), 2);
 }
 
+#[test]
+fn test_not_and_paren_query() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"level":"ERROR","status":500}"#,
+        r#"{"level":"WARN","status":503}"#,
+        r#"{"level":"ERROR","status":200}"#,
+        r#"{"level":"INFO","status":500}"#,
+    ]);
+
+    let out = daemon.query("(level = ERROR OR level = WARN) AND status >= 500");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out).lines().count(), 2);
+
+    let out = daemon.query("NOT status = 500 | count");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "2");
+}
+
 // --- Aggregations ---
 
 #[test]
