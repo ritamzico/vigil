@@ -98,6 +98,21 @@ fn parse_aggregation(tokens: &[&str], pos: usize) -> Result<Option<Aggregation>,
 
             Ok(Some(Aggregation::Average(field.to_string())))
         }
+        agg @ ("sum" | "min" | "max") => {
+            let field = tokens.get(pos + 1).ok_or_else(|| {
+                IncorrectFormat(format!("'{}' requires a field name, e.g.: {} latency_ms", agg, agg))
+            })?;
+
+            if tokens.get(pos + 2).is_some() {
+                return Err(unexpected_token(tokens, pos + 2));
+            }
+
+            Ok(Some(match agg {
+                "sum" => Aggregation::Sum(field.to_string()),
+                "min" => Aggregation::Min(field.to_string()),
+                _ => Aggregation::Max(field.to_string()),
+            }))
+        }
         token => {
             if let Some(digits) = token.strip_prefix('p') {
                 let n: u8 = digits
@@ -121,7 +136,7 @@ fn parse_aggregation(tokens: &[&str], pos: usize) -> Result<Option<Aggregation>,
                 return Ok(Some(Aggregation::Percentage(field, n as f32 / 100.0)));
             }
             Err(IncorrectFormat(format!(
-                "unknown aggregator '{}'; expected: count, avg, or p<N> (e.g. p99)",
+                "unknown aggregator '{}'; expected: count, avg, sum, min, max, or p<N> (e.g. p99)",
                 token
             )))
         }
@@ -786,7 +801,7 @@ mod tests {
     #[test]
     fn test_error_unknown_aggregator() {
         assert!(matches!(
-            parse_query("status = 500 | sum", None),
+            parse_query("status = 500 | median", None),
             Err(ParseError::IncorrectFormat(_))
         ));
     }
@@ -811,6 +826,48 @@ mod tests {
     fn test_error_avg_with_extra_token() {
         assert!(matches!(
             parse_query("status = 500 | avg latency_ms extra", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_sum_aggregation() {
+        let plan = parse_query("status = 500 | sum latency_ms", None).unwrap();
+        assert!(matches!(plan.aggregation, Some(Aggregation::Sum(f)) if f == "latency_ms"));
+    }
+
+    #[test]
+    fn test_min_aggregation() {
+        let plan = parse_query("status = 500 | min latency_ms", None).unwrap();
+        assert!(matches!(plan.aggregation, Some(Aggregation::Min(f)) if f == "latency_ms"));
+    }
+
+    #[test]
+    fn test_max_aggregation() {
+        let plan = parse_query("status = 500 | max latency_ms", None).unwrap();
+        assert!(matches!(plan.aggregation, Some(Aggregation::Max(f)) if f == "latency_ms"));
+    }
+
+    #[test]
+    fn test_error_sum_missing_field() {
+        assert!(matches!(
+            parse_query("status = 500 | sum", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_min_missing_field() {
+        assert!(matches!(
+            parse_query("status = 500 | min", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_max_with_extra_token() {
+        assert!(matches!(
+            parse_query("status = 500 | max latency_ms extra", None),
             Err(ParseError::IncorrectFormat(_))
         ));
     }

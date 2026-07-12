@@ -233,6 +233,28 @@ fn test_avg_aggregation() {
     assert_eq!(stdout(&out), "200");
 }
 
+#[test]
+fn test_sum_min_max_aggregations() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"status":500,"latency":100}"#,
+        r#"{"status":500,"latency":300}"#,
+        r#"{"status":200,"latency":900}"#,
+    ]);
+
+    let out = daemon.query("status = 500 | sum latency");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "400");
+
+    let out = daemon.query("status = 500 | min latency");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "100");
+
+    let out = daemon.query("status = 500 | max latency");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "300");
+}
+
 // --- Time range ---
 
 #[test]
