@@ -158,10 +158,26 @@ Requires `--time-field <field>` when starting the daemon. The field's value must
 <time-field> < <timestamp>    # events before this time
 ```
 
+`<timestamp>` is one of:
+
+| Form | Meaning |
+|------|---------|
+| RFC 3339 | absolute time, e.g. `2026-01-15T00:00:00Z` |
+| `now` | the current time |
+| `-<N><s\|m\|h\|d>` | `N` seconds/minutes/hours/days ago, e.g. `-1h` |
+
+Relative values resolve when the query runs, so `timestamp > -1h` always means the last hour.
+
+```
+timestamp > -1h                 # events from the last hour
+timestamp > -30m | count        # count of events from the last 30 minutes
+```
+
 Combine with `AND` for a range:
 
 ```
 timestamp > 2026-01-15T00:00:00Z AND timestamp < 2026-01-15T06:00:00Z
+timestamp > -1d AND timestamp < -12h
 ```
 
 #### Match all

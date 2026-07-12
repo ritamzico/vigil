@@ -1,7 +1,7 @@
 use crate::parser::ParseError::{IncorrectFormat, UnknownOperator};
 use crate::query::{Aggregation, ComparisonOp, Query, QueryPlan};
 use crate::value::Value;
-use chrono::DateTime;
+use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -215,13 +215,12 @@ fn parse_time_range(tokens: &[&str], pos: usize) -> Result<(Query, usize), Parse
         op => return Err(UnknownOperator(String::from(op))),
     };
 
-    let time_value = DateTime::parse_from_rfc3339(
+    let time_value = parse_time_value(
         tokens
             .get(pos + 2)
             .ok_or_else(|| IncorrectFormat(String::from("expected datetime value")))?,
     )
-    .map_err(|_| IncorrectFormat(String::from("invalid datetime, expected RFC 3339 (e.g. 2026-01-15T00:00:00Z)")))?
-    .to_utc();
+    .ok_or_else(|| IncorrectFormat(String::from("invalid datetime, expected RFC 3339 (e.g. 2026-01-15T00:00:00Z), 'now', or a relative offset (e.g. -1h)")))?;
 
     let (start, end) = match op {
         ComparisonOp::Lt => (None, Some(time_value)),
@@ -230,6 +229,36 @@ fn parse_time_range(tokens: &[&str], pos: usize) -> Result<(Query, usize), Parse
     };
 
     Ok((Query::TimeRange { start, end }, pos + 3))
+}
+
+// Parses a time value: RFC 3339 (e.g. "2026-01-15T00:00:00Z"), "now", or a
+// relative offset "-<N><unit>" with unit s/m/h/d (e.g. "-1h" = one hour ago).
+// Relative values resolve against Utc::now() at parse time, i.e. per query.
+fn parse_time_value(s: &str) -> Option<DateTime<Utc>> {
+    if let Ok(time_value) = DateTime::parse_from_rfc3339(s) {
+        return Some(time_value.to_utc());
+    }
+
+    if s == "now" {
+        return Some(Utc::now());
+    }
+
+    let rest = s.strip_prefix('-')?;
+    let unit = rest.chars().last()?;
+    let n: i64 = rest[..rest.len() - unit.len_utf8()]
+        .parse()
+        .ok()
+        .filter(|n| *n >= 0)?;
+
+    let offset = match unit {
+        's' => Duration::seconds(n),
+        'm' => Duration::minutes(n),
+        'h' => Duration::hours(n),
+        'd' => Duration::days(n),
+        _ => return None,
+    };
+
+    Some(Utc::now() - offset)
 }
 
 #[cfg(test)]
@@ -383,6 +412,56 @@ mod tests {
             parse_filter("time > 2026-01-01T00:00:00Z"),
             Ok(Query::FieldComparison { .. })
         ));
+    }
+
+    // --- Relative time values ---
+
+    // Relative values resolve against Utc::now(), so compare with a tolerance.
+    fn assert_near(actual: chrono::DateTime<Utc>, expected: chrono::DateTime<Utc>) {
+        assert!(
+            (actual - expected).num_seconds().abs() < 5,
+            "expected {} to be within 5s of {}",
+            actual,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_time_relative_hour_sets_start_near_now_minus_1h() {
+        let query = parse_filter_with_time("time > -1h").unwrap();
+        match query {
+            Query::TimeRange { start: Some(start), end: None } => {
+                assert_near(start, Utc::now() - Duration::hours(1));
+            }
+            other => panic!("expected TimeRange with start, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_time_now_sets_end_near_now() {
+        let query = parse_filter_with_time("time < now").unwrap();
+        match query {
+            Query::TimeRange { start: None, end: Some(end) } => {
+                assert_near(end, Utc::now());
+            }
+            other => panic!("expected TimeRange with end, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_time_value_units() {
+        for (s, secs) in [("-30s", 30), ("-5m", 300), ("-1h", 3600), ("-2d", 172800)] {
+            let parsed = parse_time_value(s).unwrap();
+            assert_near(parsed, Utc::now() - Duration::seconds(secs));
+        }
+    }
+
+    #[test]
+    fn test_parse_time_value_rfc3339() {
+        assert_eq!(
+            parse_time_value("2026-01-01T00:00:00Z"),
+            Some(dt("2026-01-01T00:00:00Z"))
+        );
     }
 
     // --- AND ---
@@ -555,6 +634,22 @@ mod tests {
     fn test_error_time_invalid_datetime() {
         assert!(matches!(
             parse_query("time > not-a-date", Some("time")),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_time_relative_bad_unit() {
+        assert!(matches!(
+            parse_query("time > -1x", Some("time")),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_time_relative_missing_number() {
+        assert!(matches!(
+            parse_query("time > -h", Some("time")),
             Err(ParseError::IncorrectFormat(_))
         ));
     }
