@@ -208,6 +208,10 @@ pub fn compare(op: &ComparisonOp, candidate: &Value, value: &Value) -> bool {
         ComparisonOp::Le => candidate <= value,
         ComparisonOp::Gt => candidate > value,
         ComparisonOp::Ge => candidate >= value,
+        ComparisonOp::Contains => matches!(
+            (candidate, value),
+            (Value::String(c), Value::String(v)) if c.contains(v.as_str())
+        ),
     }
 }
 
@@ -393,6 +397,55 @@ mod tests {
             value: Value::Number(200.0),
         };
         assert_eq!(result_count(idx.apply_query(&q)), 2);
+    }
+
+    #[test]
+    fn test_field_contains_substring() {
+        let mut idx = Index::new();
+        idx.push_event(make_event(
+            None,
+            vec![("message", Value::String("connection timeout after 30s".into()))],
+        ));
+        idx.push_event(make_event(
+            None,
+            vec![("message", Value::String("request ok".into()))],
+        ));
+
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("timeout".into()),
+        };
+        assert_eq!(result_count(idx.apply_query(&q)), 1);
+    }
+
+    #[test]
+    fn test_field_contains_no_match() {
+        let mut idx = Index::new();
+        idx.push_event(make_event(
+            None,
+            vec![("message", Value::String("request ok".into()))],
+        ));
+
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("timeout".into()),
+        };
+        assert_eq!(result_count(idx.apply_query(&q)), 0);
+    }
+
+    #[test]
+    fn test_field_contains_non_string_field_no_match() {
+        let mut idx = Index::new();
+        idx.push_event(make_event(None, vec![("status", Value::Number(500.0))]));
+
+        let q = Query::FieldComparison {
+            field: "status".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("500".into()),
+        };
+        assert_eq!(result_count(idx.apply_query(&q)), 0);
     }
 
     #[test]

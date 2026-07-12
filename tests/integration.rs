@@ -153,6 +153,22 @@ fn test_or_query() {
     assert_eq!(stdout(&out).lines().count(), 2);
 }
 
+#[test]
+fn test_contains_query() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"message":"connection timeout after 30s"}"#,
+        r#"{"message":"request ok"}"#,
+    ]);
+
+    let out = daemon.query("message ~ timeout");
+
+    assert!(out.status.success());
+    let body = stdout(&out);
+    assert_eq!(body.lines().count(), 1);
+    assert!(body.contains("timeout"));
+}
+
 // --- Aggregations ---
 
 #[test]
