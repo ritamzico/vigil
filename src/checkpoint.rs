@@ -76,7 +76,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_saves_snapshot_from_index_and_wal_state() {
         let dir = tempdir().unwrap();
-        let index = Arc::new(RwLock::new(Index::new()));
+        let index = Arc::new(RwLock::new(Index::new(None)));
         index.write().unwrap().push_event(make_event("a"));
         index.write().unwrap().push_event(make_event("b"));
 
@@ -105,7 +105,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_truncates_wal_after_saving() {
         let dir = tempdir().unwrap();
-        let index = Arc::new(RwLock::new(Index::new()));
+        let index = Arc::new(RwLock::new(Index::new(None)));
         index.write().unwrap().push_event(make_event("a"));
 
         let wal = make_wal(dir.path()).await;
@@ -124,7 +124,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_on_empty_index_and_wal() {
         let dir = tempdir().unwrap();
-        let index = Arc::new(RwLock::new(Index::new()));
+        let index = Arc::new(RwLock::new(Index::new(None)));
         let wal = make_wal(dir.path()).await;
 
         checkpoint(dir.path(), &index, &wal, &None).await.unwrap();
@@ -158,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_checkpoint_task_checkpoints_periodically() {
         let dir = tempdir().unwrap();
-        let index = Arc::new(RwLock::new(Index::new()));
+        let index = Arc::new(RwLock::new(Index::new(None)));
         index.write().unwrap().push_event(make_event("a"));
 
         let wal = make_wal(dir.path()).await;
