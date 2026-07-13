@@ -57,6 +57,9 @@ struct Args {
     #[arg(long)]
     no_persist: bool,
 
+    #[arg(long)]
+    max_events: Option<usize>,
+
     query: Option<String>,
 }
 
@@ -76,6 +79,7 @@ async fn main() {
                 Duration::from_millis(args.fsync_interval_ms),
                 Duration::from_secs(args.checkpoint_interval_secs),
                 args.no_persist,
+                args.max_events,
             )
             .await
         }
@@ -95,6 +99,7 @@ async fn run_daemon(
     fsync_interval: Duration,
     checkpoint_interval: Duration,
     no_persist: bool,
+    max_events: Option<usize>,
 ) {
     let file_path = match File::open(&path) {
         Ok(_) => path,
@@ -126,6 +131,9 @@ async fn run_daemon(
         if no_persist {
             cmd.arg("--no-persist");
         }
+        if let Some(max_events) = max_events {
+            cmd.arg("--max-events").arg(max_events.to_string());
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -141,29 +149,29 @@ async fn run_daemon(
         };
     }
 
-    let (index_inner, wal_inner, byte_offset, mut resolved_dir) =
-        resolve_state(&file_path, data_dir_override.clone(), no_persist).await;
+    let (index_inner, wal_inner, byte_offset, mut resolved_dir) = resolve_state(
+        &file_path,
+        data_dir_override.clone(),
+        no_persist,
+        max_events,
+    )
+    .await;
 
     let index = Arc::new(RwLock::new(index_inner));
     let mut wal: Option<Arc<Mutex<WAL>>> = wal_inner.map(|w| Arc::new(Mutex::new(w)));
 
     // Ingest the file's existing contents before accepting queries, so a client
     // that connects the instant the socket appears never sees a partial index.
-    let byte_offset = match tailer::initial_read(
-        &file_path,
-        &index,
-        time_field.as_deref(),
-        &wal,
-        byte_offset,
-    )
-    .await
-    {
-        Ok(offset) => offset,
-        Err(e) => {
-            eprintln!("Tailer error: {e}");
-            std::process::exit(1);
-        }
-    };
+    let byte_offset =
+        match tailer::initial_read(&file_path, &index, time_field.as_deref(), &wal, byte_offset)
+            .await
+        {
+            Ok(offset) => offset,
+            Err(e) => {
+                eprintln!("Tailer error: {e}");
+                std::process::exit(1);
+            }
+        };
 
     let listener = UnixListener::bind(message::SOCKET_PATH).unwrap();
 
@@ -256,7 +264,7 @@ async fn run_daemon(
                 current_time_field = new_time_field.clone();
 
                 let (new_index, new_wal, new_byte_offset, new_dir) =
-                    resolve_state(&new_path, data_dir_override.clone(), no_persist).await;
+                    resolve_state(&new_path, data_dir_override.clone(), no_persist, max_events).await;
 
                 *index.write().unwrap() = new_index;
                 wal = new_wal.map(|w| Arc::new(Mutex::new(w)));
@@ -288,9 +296,10 @@ async fn resolve_state(
     path: &Path,
     data_dir_override: Option<PathBuf>,
     no_persist: bool,
+    max_events: Option<usize>,
 ) -> (Index, Option<WAL>, u64, Option<PathBuf>) {
     if no_persist {
-        return (Index::new(), None, 0, None);
+        return (Index::new(max_events), None, 0, None);
     }
 
     let dir = match data_dir(path, data_dir_override).await {
@@ -301,7 +310,7 @@ async fn resolve_state(
         }
     };
 
-    let recovered = match recover(&dir).await {
+    let recovered = match recover(&dir, max_events).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!(

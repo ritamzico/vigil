@@ -80,7 +80,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn make_index(events: Vec<Event>) -> Arc<RwLock<Index>> {
-        let index = Arc::new(RwLock::new(Index::new()));
+        let index = Arc::new(RwLock::new(Index::new(None)));
         let mut guard = index.write().unwrap();
         for event in events {
             guard.push_event(event);

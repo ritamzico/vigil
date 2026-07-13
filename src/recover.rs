@@ -25,8 +25,8 @@ impl Recovered {
     }
 }
 
-pub async fn recover(dir: &Path) -> io::Result<Recovered> {
-    let mut index = Index::new();
+pub async fn recover(dir: &Path, max_events: Option<usize>) -> io::Result<Recovered> {
+    let mut index = Index::new(max_events);
     let mut next_seq: u64 = 0;
     let mut byte_offset: u64 = 0;
 
@@ -106,7 +106,7 @@ mod tests {
     async fn test_recover_empty_dir_returns_empty_index() {
         let dir = tempdir().unwrap();
 
-        let recovered = recover(dir.path()).await.unwrap();
+        let recovered = recover(dir.path(), None).await.unwrap();
 
         assert_eq!(recovered.index.event_count(), 0);
         assert_eq!(recovered.byte_offset, 0);
@@ -119,7 +119,7 @@ mod tests {
         let dir = tempdir().unwrap();
         write_wal_records(dir.path(), 0, &["a", "b", "c"]).await;
 
-        let recovered = recover(dir.path()).await.unwrap();
+        let recovered = recover(dir.path(), None).await.unwrap();
 
         assert_eq!(recovered.index.event_count(), 3);
         assert_eq!(recovered.wal.next_seq, 3);
@@ -136,7 +136,7 @@ mod tests {
             .await
             .unwrap();
 
-        let recovered = recover(dir.path()).await.unwrap();
+        let recovered = recover(dir.path(), None).await.unwrap();
 
         assert_eq!(recovered.index.event_count(), 1);
         assert_eq!(recovered.byte_offset, 50);
@@ -154,7 +154,7 @@ mod tests {
 
         write_wal_records(dir.path(), 3, &["w3", "w4"]).await;
 
-        let recovered = recover(dir.path()).await.unwrap();
+        let recovered = recover(dir.path(), None).await.unwrap();
 
         assert_eq!(recovered.index.event_count(), 5);
         assert_eq!(recovered.wal.next_seq, 5);
@@ -174,7 +174,7 @@ mod tests {
 
         write_wal_records(dir.path(), 3, &["s3", "s4", "w5", "w6"]).await;
 
-        let recovered = recover(dir.path()).await.unwrap();
+        let recovered = recover(dir.path(), None).await.unwrap();
 
         // 5 from the snapshot + only seq 5 and 6 from the WAL (3 and 4 filtered out)
         assert_eq!(recovered.index.event_count(), 7);
@@ -186,7 +186,7 @@ mod tests {
         let dir = tempdir().unwrap();
         write_wal_records(dir.path(), 0, &["a", "b"]).await;
 
-        let mut recovered = recover(dir.path()).await.unwrap();
+        let mut recovered = recover(dir.path(), None).await.unwrap();
         assert_eq!(recovered.wal.next_seq, 2);
 
         recovered.wal.append(999, make_event("c")).await.unwrap();

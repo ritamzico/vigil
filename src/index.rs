@@ -10,6 +10,9 @@ use std::fmt;
 use std::ops::Bound::{Included, Unbounded};
 use thiserror::Error;
 
+const SLACK: usize = 1024;
+const DEFAULT_MAX_EVENTS: usize = 2_000_000;
+
 #[derive(Debug, Error)]
 pub enum AggregationError {
     #[error("field '{0}' not found in any matching event")]
@@ -26,6 +29,7 @@ pub struct Index {
     pub events: Vec<Event>,
     field_index: HashMap<String, HashMap<Value, Vec<usize>>>,
     time_index: BTreeMap<DateTime<Utc>, Vec<usize>>,
+    max_events: usize,
 }
 
 impl fmt::Display for Index {
@@ -38,27 +42,23 @@ impl fmt::Display for Index {
 }
 
 impl Index {
-    pub fn new() -> Index {
+    pub fn new(max_events: Option<usize>) -> Index {
         Index {
             events: vec![],
             field_index: HashMap::new(),
             time_index: BTreeMap::new(),
+            max_events: max_events.unwrap_or(DEFAULT_MAX_EVENTS),
         }
     }
 
     pub fn push_event(&mut self, event: Event) {
-        let i = self.events.len();
-
-        for (field, value) in &event.fields {
-            let field_map = self.field_index.entry(field.clone()).or_default();
-            field_map.entry(value.clone()).or_default().push(i);
-        }
-
-        if let Some(timestamp) = event.timestamp {
-            self.time_index.entry(timestamp).or_default().push(i);
-        }
-
+        self.push_to_field_and_time_index(self.events.len(), &event);
         self.events.push(event);
+
+        if self.events.len() > self.max_events + SLACK {
+            self.events.drain(0..self.events.len() - self.max_events);
+            self.reindex();
+        }
     }
 
     #[cfg(test)]
@@ -158,6 +158,28 @@ impl Index {
             Query::Not(query) => self.not_indices(query),
             Query::All() => (0..self.events.len()).collect(),
         }
+    }
+
+    fn push_to_field_and_time_index(&mut self, i: usize, event: &Event) {
+        for (field, value) in &event.fields {
+            let field_map = self.field_index.entry(field.clone()).or_default();
+            field_map.entry(value.clone()).or_default().push(i);
+        }
+
+        if let Some(timestamp) = event.timestamp {
+            self.time_index.entry(timestamp).or_default().push(i);
+        }
+    }
+
+    fn reindex(&mut self) {
+        self.field_index.clear();
+        self.time_index.clear();
+
+        let events = std::mem::take(&mut self.events);
+        for (i, event) in events.iter().enumerate() {
+            self.push_to_field_and_time_index(i, event);
+        }
+        self.events = events;
     }
 
     fn field_comparison_indices(
@@ -295,13 +317,13 @@ mod tests {
 
     #[test]
     fn test_event_count_empty() {
-        let idx = Index::new();
+        let idx = Index::new(None);
         assert_eq!(idx.event_count(), 0);
     }
 
     #[test]
     fn test_event_count_after_push() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![]));
         idx.push_event(make_event(None, vec![]));
         assert_eq!(idx.event_count(), 2);
@@ -309,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_field_eq_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
             vec![("level", Value::String("error".into()))],
@@ -329,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_field_eq_no_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
             vec![("level", Value::String("info".into()))],
@@ -345,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_field_missing_returns_empty() {
-        let idx = Index::new();
+        let idx = Index::new(None);
         let q = Query::FieldComparison {
             field: "nonexistent".into(),
             op: ComparisonOp::Eq,
@@ -356,7 +378,7 @@ mod tests {
 
     #[test]
     fn test_field_ne() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
             vec![("level", Value::String("error".into()))],
@@ -376,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_field_gt_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(500.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(404.0))]));
@@ -391,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_field_lt_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(100.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(300.0))]));
@@ -406,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_field_ge_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(100.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(300.0))]));
@@ -421,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_field_le_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(100.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(300.0))]));
@@ -436,10 +458,13 @@ mod tests {
 
     #[test]
     fn test_field_contains_substring() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
-            vec![("message", Value::String("connection timeout after 30s".into()))],
+            vec![(
+                "message",
+                Value::String("connection timeout after 30s".into()),
+            )],
         ));
         idx.push_event(make_event(
             None,
@@ -456,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_field_contains_no_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
             vec![("message", Value::String("request ok".into()))],
@@ -472,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_field_contains_non_string_field_no_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("status", Value::Number(500.0))]));
 
         let q = Query::FieldComparison {
@@ -485,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_time_range_both_bounds() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 6, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 12, 31)), vec![]));
@@ -499,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_time_range_no_bounds() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2023, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
 
@@ -512,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_time_range_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2020, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2021, 1, 1)), vec![]));
 
@@ -525,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_time_range_open_start() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2022, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
 
@@ -538,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_time_range_open_end() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2022, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
 
@@ -551,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_event_without_timestamp_excluded_from_time_range() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![]));
 
         let q = Query::TimeRange {
@@ -573,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_and_two_field_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -613,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_and_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -646,7 +671,7 @@ mod tests {
 
     #[test]
     fn test_and_all_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -679,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_and_field_and_time_range() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(Event::new(
             Some(ts(2024, 6, 1)),
             "e1".to_string(),
@@ -720,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_or_disjoint_sets() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("error".into()))],
@@ -751,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_or_overlapping_sets_no_dedup() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -785,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_or_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("info".into()))],
@@ -808,7 +833,7 @@ mod tests {
 
     #[test]
     fn test_or_all_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("error".into()))],
@@ -837,7 +862,7 @@ mod tests {
 
     #[test]
     fn test_not_excludes_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
         idx.push_event(make_event_raw("e2", vec![("status", Value::Number(200.0))]));
         idx.push_event(make_event_raw("e3", vec![("status", Value::Number(500.0))]));
@@ -850,9 +875,12 @@ mod tests {
 
     #[test]
     fn test_not_includes_events_missing_field() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
-        idx.push_event(make_event_raw("e2", vec![("level", Value::String("info".into()))]));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![("level", Value::String("info".into()))],
+        ));
 
         // The complement is over all events, so events without the field match too.
         let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
@@ -862,7 +890,7 @@ mod tests {
 
     #[test]
     fn test_not_no_matches_returns_all() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
         idx.push_event(make_event_raw("e2", vec![("status", Value::Number(404.0))]));
 
@@ -872,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_and_with_not() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -908,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_results_in_insertion_order() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         for (raw, level) in [
             ("e1", "error"),
             ("e2", "info"),
@@ -916,7 +944,10 @@ mod tests {
             ("e4", "info"),
             ("e5", "error"),
         ] {
-            idx.push_event(make_event_raw(raw, vec![("level", Value::String(level.into()))]));
+            idx.push_event(make_event_raw(
+                raw,
+                vec![("level", Value::String(level.into()))],
+            ));
         }
 
         let q = Query::FieldComparison {
@@ -930,13 +961,10 @@ mod tests {
 
     #[test]
     fn test_or_containing_and() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
-            vec![
-                ("a", Value::Number(1.0)),
-                ("b", Value::Number(2.0)),
-            ],
+            vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))],
         ));
         idx.push_event(make_event_raw("e2", vec![("c", Value::Number(3.0))]));
         idx.push_event(make_event_raw("e3", vec![("a", Value::Number(1.0))]));
@@ -955,7 +983,7 @@ mod tests {
 
     #[test]
     fn test_matching_indices_sorted_deduped() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -992,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_count_basic() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
         idx.push_event(make_event_raw("e2", vec![("status", Value::Number(500.0))]));
         idx.push_event(make_event_raw("e3", vec![("status", Value::Number(200.0))]));
@@ -1003,7 +1031,7 @@ mod tests {
 
     #[test]
     fn test_count_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
 
         let plan = make_plan(eq("status", Value::Number(500.0)), Some(Aggregation::Count));
@@ -1012,7 +1040,7 @@ mod tests {
 
     #[test]
     fn test_avg_basic() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("latency", Value::Number(100.0))],
@@ -1042,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_avg_skips_events_missing_field() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("latency", Value::Number(100.0))],
@@ -1070,7 +1098,7 @@ mod tests {
 
     #[test]
     fn test_avg_error_no_matching_events() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
 
         let plan = make_plan(
@@ -1085,7 +1113,7 @@ mod tests {
 
     #[test]
     fn test_avg_error_field_not_found() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
 
         let plan = make_plan(
@@ -1100,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_avg_error_incompatible_type_string() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("ERROR".into()))],
@@ -1118,7 +1146,7 @@ mod tests {
 
     #[test]
     fn test_avg_error_incompatible_type_bool() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("active", Value::Bool(true))]));
 
         let plan = make_plan(
@@ -1132,7 +1160,7 @@ mod tests {
     }
 
     fn latency_index() -> Index {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("latency", Value::Number(100.0))],
@@ -1183,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_sum_error_no_matching_events() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
 
         let plan = make_plan(
@@ -1198,7 +1226,7 @@ mod tests {
 
     #[test]
     fn test_min_error_no_matching_events() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
 
         let plan = make_plan(
@@ -1213,7 +1241,7 @@ mod tests {
 
     #[test]
     fn test_max_error_no_matching_events() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
 
         let plan = make_plan(
@@ -1228,7 +1256,7 @@ mod tests {
 
     #[test]
     fn test_sum_error_incompatible_type() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("ERROR".into()))],
@@ -1246,7 +1274,7 @@ mod tests {
 
     #[test]
     fn test_min_error_incompatible_type() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("ERROR".into()))],
@@ -1264,7 +1292,7 @@ mod tests {
 
     #[test]
     fn test_max_error_incompatible_type() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("ERROR".into()))],
@@ -1278,5 +1306,130 @@ mod tests {
             idx.apply_query_plan(&plan),
             Err(AggregationError::IncompatibleType(_))
         ));
+    }
+
+    // --- Bounded memory / retention ---
+
+    fn numbered_event(i: usize) -> Event {
+        let fields = vec![("n".to_string(), Value::Number(i as f32))]
+            .into_iter()
+            .collect();
+        Event::new(
+            Some(Utc.timestamp_opt(i as i64 + 1, 0).unwrap()),
+            format!("e{i}"),
+            fields,
+        )
+    }
+
+    #[test]
+    fn test_no_eviction_at_cap_plus_slack_boundary() {
+        let max = 3;
+        let mut idx = Index::new(Some(max));
+        for i in 0..(max + SLACK) {
+            idx.push_event(numbered_event(i));
+        }
+
+        // Compaction only triggers strictly past max + SLACK, so nothing is evicted yet.
+        assert_eq!(idx.event_count(), max + SLACK);
+    }
+
+    #[test]
+    fn test_eviction_past_cap_evicts_oldest() {
+        let max = 3;
+        let total = max + SLACK + 1;
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+
+        // One push past the boundary compacts back down to exactly `max`.
+        assert_eq!(idx.event_count(), max);
+
+        // The survivors are the most recent `max` events, in order.
+        let survivors: Vec<String> = idx.events.iter().map(|e| e.raw.clone()).collect();
+        let expected: Vec<String> = ((total - max)..total).map(|i| format!("e{i}")).collect();
+        assert_eq!(survivors, expected);
+    }
+
+    #[test]
+    fn test_queries_see_only_recent_after_eviction() {
+        let max = 3;
+        let total = max + SLACK + 1;
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+
+        // An evicted event's field value is no longer queryable.
+        let evicted = Query::FieldComparison {
+            field: "n".into(),
+            op: ComparisonOp::Eq,
+            value: Value::Number(0.0),
+        };
+        assert_eq!(result_count(idx.apply_query(&evicted)), 0);
+
+        // A retained event still matches exactly once and resolves to the right event.
+        let retained = Query::FieldComparison {
+            field: "n".into(),
+            op: ComparisonOp::Eq,
+            value: Value::Number((total - 1) as f32),
+        };
+        let hits = idx.apply_query(&retained);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].raw, format!("e{}", total - 1));
+    }
+
+    #[test]
+    fn test_indexes_have_no_stale_positions_after_reindex() {
+        let max = 5;
+        // Two full compaction cycles, landing exactly on a boundary so the count is `max`.
+        let total = max + 2 * (SLACK + 1);
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+        assert_eq!(idx.event_count(), max);
+
+        // Every position in field_index points into the live events vec and back
+        // to the event that actually holds that value.
+        for value_map in idx.field_index.values() {
+            for (value, positions) in value_map {
+                for &pos in positions {
+                    assert!(pos < idx.events.len());
+                    assert_eq!(&idx.events[pos].fields["n"], value);
+                }
+            }
+        }
+
+        // Same for the time index.
+        for (timestamp, positions) in &idx.time_index {
+            for &pos in positions {
+                assert!(pos < idx.events.len());
+                assert_eq!(idx.events[pos].timestamp, Some(*timestamp));
+            }
+        }
+    }
+
+    #[test]
+    fn test_pushes_after_compaction_are_indexed_correctly() {
+        let max = 3;
+        let total = max + SLACK + 1;
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+
+        // Events added after a compaction must be positioned and indexed correctly.
+        idx.push_event(numbered_event(total));
+        idx.push_event(numbered_event(total + 1));
+
+        let q = Query::FieldComparison {
+            field: "n".into(),
+            op: ComparisonOp::Eq,
+            value: Value::Number((total + 1) as f32),
+        };
+        let hits = idx.apply_query(&q);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].raw, format!("e{}", total + 1));
     }
 }

@@ -135,7 +135,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     fn make_index() -> Arc<RwLock<Index>> {
-        Arc::new(RwLock::new(Index::new()))
+        Arc::new(RwLock::new(Index::new(None)))
     }
 
     async fn make_wal() -> Option<Arc<Mutex<WAL>>> {
