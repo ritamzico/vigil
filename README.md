@@ -84,7 +84,7 @@ Persisted state lives in a per-file data directory: `$HOME/.local/share/vigil/<h
 | `--fsync-interval-ms <ms>` | `500` | How often the WAL is flushed and fsync'd to disk |
 | `--checkpoint-interval-secs <secs>` | `60` | How often a full snapshot is written and the WAL truncated |
 | `--no-persist` | off | Disable persistence entirely (pure in-memory; restart re-reads the file) |
-| `--max-events <n>` | unbounded | Retain only the most recent events, evicting the oldest to keep memory bounded |
+| `--max-events <n>` | `2000000` | Retain only the most recent events, evicting the oldest to keep memory bounded |
 
 **Trade-offs.** A shorter `--fsync-interval-ms` narrows the window of events that could be lost on a hard crash, at the cost of more frequent disk I/O. A shorter `--checkpoint-interval-secs` keeps the WAL small and speeds crash recovery, at the cost of more frequent snapshot writes. With `--max-events <n>`, queries only ever see the most recent `n` events — older events are dropped once the cap is exceeded. Eviction is amortized, so the index may transiently hold up to ~1024 events beyond `n` before compacting back down.
 
