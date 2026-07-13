@@ -7,9 +7,11 @@ use chrono::DateTime;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::io::SeekFrom;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::fs;
 use tokio::fs::File;
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
@@ -39,11 +41,32 @@ pub async fn run_tailer(
 ) -> Result<(), io::Error> {
     let mut byte_offset = starting_byte_offset;
 
+    let mut last_inode = fs::metadata(&file_path).await.ok().map(|m| m.ino());
+
     loop {
+        (byte_offset, last_inode) = check_rotation(&file_path, byte_offset, last_inode).await?;
         byte_offset =
             read_file(&file_path, &index, byte_offset, time_field.as_deref(), &wal).await?;
         sleep(Duration::from_millis(SLEEP_TIME)).await;
     }
+}
+
+async fn check_rotation(
+    file_path: &PathBuf,
+    byte_offset: u64,
+    last_inode: Option<u64>,
+) -> io::Result<(u64, Option<u64>)> {
+    let Ok(metadata) = fs::metadata(file_path).await else {
+        return Ok((byte_offset, last_inode));
+    };
+
+    let new_inode = Some(metadata.ino());
+
+    if metadata.len() < byte_offset || last_inode != new_inode {
+        return Ok((0, new_inode));
+    }
+
+    Ok((byte_offset, last_inode))
 }
 
 async fn read_file(
@@ -53,7 +76,9 @@ async fn read_file(
     time_field: Option<&str>,
     wal: &Option<Arc<Mutex<WAL>>>,
 ) -> Result<u64, io::Error> {
-    let file = File::open(file_path).await?;
+    let Ok(file) = File::open(file_path).await else {
+        return Ok(byte_offset);
+    };
     let mut reader = io::BufReader::new(file);
 
     reader.seek(SeekFrom::Start(byte_offset)).await?;
@@ -373,18 +398,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nonexistent_file_returns_error() {
+    async fn test_nonexistent_file_returns_unchanged_offset() {
         let index = make_index();
-        let wal = make_wal().await;
-        let result = read_file(
-            &PathBuf::from("test_files/does_not_exist.log"),
-            &index,
-            0,
-            None,
-            &wal,
-        )
-        .await;
-        assert!(result.is_err());
+
+        let offset = 1;
+        let inode = Some(0);
+
+        let mut new_offset;
+        let new_inode;
+
+        new_offset = read("test_files/does_not_exist.log", &index, offset, None).await;
+        assert_eq!(offset, new_offset);
+
+        (new_offset, new_inode) = check_rotation(&PathBuf::new(), offset, inode)
+            .await
+            .unwrap();
+
+        assert_eq!(offset, new_offset);
+        assert_eq!(inode, new_inode);
+    }
+
+    #[tokio::test]
+    async fn test_check_rotation_returns_unchanged_offset_for_unchanged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+
+        let inode = Some(std::fs::metadata(&path).unwrap().ino());
+        let offset = 1;
+
+        std::fs::write(&path, "line three\nline four\n").unwrap();
+        let (new_offset, new_inode) = check_rotation(&path, offset, inode).await.unwrap();
+
+        assert_eq!(new_offset, offset);
+        assert_eq!(new_inode, inode);
+    }
+
+    #[tokio::test]
+    async fn test_truncation_resets_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+
+        let inode = Some(std::fs::metadata(&path).unwrap().ino());
+        let stale_offset = 100;
+
+        let (new_offset, new_inode) = check_rotation(&path, stale_offset, inode).await.unwrap();
+
+        assert_eq!(new_offset, 0);
+        assert_eq!(new_inode, inode);
+    }
+
+    #[tokio::test]
+    async fn test_changed_inode_updates_old_inode_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "new content\n").unwrap();
+
+        let inode = Some(std::fs::metadata(&path).unwrap().ino());
+        let offset = 1;
+
+        let other_path = dir.path().join("app.log.new");
+        std::fs::write(&other_path, "rotated content\n").unwrap();
+        std::fs::rename(&other_path, &path).unwrap();
+        let (new_offset, new_inode) = check_rotation(&path, offset, inode).await.unwrap();
+
+        assert_eq!(new_offset, 0);
+        assert_ne!(inode, new_inode);
     }
 
     #[tokio::test]
