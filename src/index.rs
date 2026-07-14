@@ -272,6 +272,25 @@ pub fn compare(op: &ComparisonOp, candidate: &Value, value: &Value) -> bool {
     }
 }
 
+/// Evaluate `query` against a single event, mirroring the index path:
+/// a missing field (or missing timestamp for time ranges) is no match.
+pub fn event_matches(event: &Event, query: &Query) -> bool {
+    match query {
+        Query::FieldComparison { field, op, value } => match event.fields.get(field) {
+            Some(candidate) => compare(op, candidate, value),
+            None => false,
+        },
+        Query::TimeRange { start, end } => match event.timestamp {
+            Some(ts) => start.is_none_or(|s| ts >= s) && end.is_none_or(|e| ts <= e),
+            None => false,
+        },
+        Query::And(queries) => queries.iter().all(|q| event_matches(event, q)),
+        Query::Or(queries) => queries.iter().any(|q| event_matches(event, q)),
+        Query::Not(query) => !event_matches(event, query),
+        Query::All() => true,
+    }
+}
+
 fn numeric_values(events: &[&Event], field: &str) -> Result<Vec<f32>, AggregationError> {
     if events.is_empty() {
         return Err(AggregationError::NoMatchingEvents);
@@ -1306,6 +1325,163 @@ mod tests {
             idx.apply_query_plan(&plan),
             Err(AggregationError::IncompatibleType(_))
         ));
+    }
+
+    // --- event_matches ---
+
+    #[test]
+    fn test_event_matches_field_eq() {
+        let event = make_event(None, vec![("level", Value::String("error".into()))]);
+        assert!(event_matches(&event, &eq("level", Value::String("error".into()))));
+        assert!(!event_matches(&event, &eq("level", Value::String("info".into()))));
+    }
+
+    #[test]
+    fn test_event_matches_field_ne() {
+        let event = make_event(None, vec![("level", Value::String("error".into()))]);
+        let q = Query::FieldComparison {
+            field: "level".into(),
+            op: ComparisonOp::Ne,
+            value: Value::String("info".into()),
+        };
+        assert!(event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_field_contains() {
+        let event = make_event(
+            None,
+            vec![("message", Value::String("connection timeout".into()))],
+        );
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("timeout".into()),
+        };
+        assert!(event_matches(&event, &q));
+
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("refused".into()),
+        };
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_missing_field_no_match() {
+        let event = make_event(None, vec![("level", Value::String("error".into()))]);
+        assert!(!event_matches(&event, &eq("status", Value::Number(500.0))));
+    }
+
+    #[test]
+    fn test_event_matches_and() {
+        let event = make_event(
+            None,
+            vec![
+                ("level", Value::String("error".into())),
+                ("status", Value::Number(500.0)),
+            ],
+        );
+        let both = Query::And(vec![
+            eq("level", Value::String("error".into())),
+            eq("status", Value::Number(500.0)),
+        ]);
+        assert!(event_matches(&event, &both));
+
+        let one = Query::And(vec![
+            eq("level", Value::String("error".into())),
+            eq("status", Value::Number(200.0)),
+        ]);
+        assert!(!event_matches(&event, &one));
+    }
+
+    #[test]
+    fn test_event_matches_or() {
+        let event = make_event(None, vec![("level", Value::String("warn".into()))]);
+        let q = Query::Or(vec![
+            eq("level", Value::String("error".into())),
+            eq("level", Value::String("warn".into())),
+        ]);
+        assert!(event_matches(&event, &q));
+
+        let q = Query::Or(vec![
+            eq("level", Value::String("error".into())),
+            eq("level", Value::String("info".into())),
+        ]);
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_not() {
+        let event = make_event(None, vec![("level", Value::String("info".into()))]);
+        let q = Query::Not(Box::new(eq("level", Value::String("error".into()))));
+        assert!(event_matches(&event, &q));
+
+        let q = Query::Not(Box::new(eq("level", Value::String("info".into()))));
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_all() {
+        let event = make_event(None, vec![]);
+        assert!(event_matches(&event, &Query::All()));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_in_bounds() {
+        let event = make_event(Some(ts(2024, 6, 1)), vec![]);
+        let q = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: Some(ts(2024, 12, 31)),
+        };
+        assert!(event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_bounds_inclusive() {
+        let event = make_event(Some(ts(2024, 1, 1)), vec![]);
+        let q = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: Some(ts(2024, 1, 1)),
+        };
+        assert!(event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_out_of_bounds() {
+        let event = make_event(Some(ts(2025, 6, 1)), vec![]);
+        let q = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: Some(ts(2024, 12, 31)),
+        };
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_open_bounds() {
+        let event = make_event(Some(ts(2024, 6, 1)), vec![]);
+        let after = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: None,
+        };
+        assert!(event_matches(&event, &after));
+
+        let before = Query::TimeRange {
+            start: None,
+            end: Some(ts(2024, 1, 1)),
+        };
+        assert!(!event_matches(&event, &before));
+    }
+
+    #[test]
+    fn test_event_matches_no_timestamp_never_matches_time_range() {
+        let event = make_event(None, vec![]);
+        let q = Query::TimeRange {
+            start: None,
+            end: None,
+        };
+        assert!(!event_matches(&event, &q));
     }
 
     // --- Bounded memory / retention ---

@@ -14,6 +14,7 @@ use std::sync::RwLock;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt};
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
@@ -29,7 +30,8 @@ pub async fn initial_read(
     wal: &Option<Arc<Mutex<WAL>>>,
     starting_byte_offset: u64,
 ) -> Result<u64, io::Error> {
-    read_file(file_path, index, starting_byte_offset, time_field, wal).await
+    // Runs before the query socket opens, so nobody can be following yet.
+    read_file(file_path, index, starting_byte_offset, time_field, wal, None).await
 }
 
 pub async fn run_tailer(
@@ -38,6 +40,7 @@ pub async fn run_tailer(
     time_field: Option<String>,
     wal: Option<Arc<Mutex<WAL>>>,
     starting_byte_offset: u64,
+    follow_tx: broadcast::Sender<Arc<Event>>,
 ) -> Result<(), io::Error> {
     let mut byte_offset = starting_byte_offset;
 
@@ -45,8 +48,15 @@ pub async fn run_tailer(
 
     loop {
         (byte_offset, last_inode) = check_rotation(&file_path, byte_offset, last_inode).await?;
-        byte_offset =
-            read_file(&file_path, &index, byte_offset, time_field.as_deref(), &wal).await?;
+        byte_offset = read_file(
+            &file_path,
+            &index,
+            byte_offset,
+            time_field.as_deref(),
+            &wal,
+            Some(&follow_tx),
+        )
+        .await?;
         sleep(Duration::from_millis(SLEEP_TIME)).await;
     }
 }
@@ -75,6 +85,7 @@ async fn read_file(
     mut byte_offset: u64,
     time_field: Option<&str>,
     wal: &Option<Arc<Mutex<WAL>>>,
+    follow_tx: Option<&broadcast::Sender<Arc<Event>>>,
 ) -> Result<u64, io::Error> {
     let Ok(file) = File::open(file_path).await else {
         return Ok(byte_offset);
@@ -122,6 +133,13 @@ async fn read_file(
                 .await?;
         }
 
+        if let Some(tx) = follow_tx {
+            // Zero cost when nobody follows.
+            if tx.receiver_count() > 0 {
+                let _ = tx.send(Arc::new(event.clone()));
+            }
+        }
+
         index.write().unwrap().push_event(event);
     }
 
@@ -151,7 +169,7 @@ mod tests {
         time_field: Option<&str>,
     ) -> u64 {
         let wal = make_wal().await;
-        read_file(&PathBuf::from(path), index, offset, time_field, &wal)
+        read_file(&PathBuf::from(path), index, offset, time_field, &wal, None)
             .await
             .unwrap()
     }
@@ -173,6 +191,7 @@ mod tests {
             0,
             None,
             &None,
+            None,
         )
         .await
         .unwrap();
@@ -477,6 +496,7 @@ mod tests {
             0,
             None,
             &wal,
+            None,
         )
         .await;
         let err = result.unwrap_err().to_string();
