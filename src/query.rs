@@ -43,6 +43,13 @@ pub enum QueryResult<'a> {
 pub struct QueryPlan {
     pub query: Query,
     pub aggregation: Option<Aggregation>,
+    pub limit: Option<Limit>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Limit {
+    Head(usize),
+    Tail(usize),
 }
 
 pub enum Aggregation {
@@ -73,7 +80,15 @@ impl fmt::Display for QueryResult<'_> {
 }
 
 impl QueryPlan {
-    pub fn new(query: Query, aggregation: Option<Aggregation>) -> QueryPlan {
-        QueryPlan { query, aggregation }
+    pub fn new(
+        query: Query,
+        aggregation: Option<Aggregation>,
+        limit: Option<Limit>,
+    ) -> QueryPlan {
+        QueryPlan {
+            query,
+            aggregation,
+            limit,
+        }
     }
 }

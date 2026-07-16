@@ -132,11 +132,15 @@ vigil --watch /var/log/app.log --max-events 1000000
 
 ## Query language
 
-A query is a filter expression, optionally followed by an aggregation using `|`.
+A query is a filter expression, optionally followed by a pipeline stage using `|`. The stage is either an aggregation or a result limit — one or the other, not both.
 
 ```
 <filter> | <aggregation>
+<filter> | limit <N>
+<filter> | tail <N>
 ```
+
+Without an aggregation, results are raw log lines in chronological (ingestion) order.
 
 ### Filters
 
@@ -246,6 +250,16 @@ status >= 500 | max latency_ms
 status >= 500 | p99 latency_ms
 status >= 500 | p50 latency_ms
 | count
+```
+
+### Result limiting
+
+Append `| limit N` or `| tail N` to a filter to cap how many raw events are returned. Results are in chronological (ingestion) order: `limit N` keeps the first N matches, `tail N` keeps the last N matches (still oldest-first). A limit occupies the same pipeline slot as an aggregation, so a query can have one or the other, not both.
+
+```
+level = ERROR | limit 20        # first 20 matching events
+level = ERROR | tail 5          # last 5 matching events
+| tail 10                       # last 10 events overall
 ```
 
 ---
