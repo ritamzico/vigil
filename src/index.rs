@@ -1,5 +1,5 @@
 use crate::event::Event;
-use crate::query::{Aggregation, ComparisonOp, Query, QueryPlan, QueryResult};
+use crate::query::{Aggregation, ComparisonOp, Limit, Query, QueryPlan, QueryResult};
 use crate::value::Value;
 use chrono::DateTime;
 use chrono::Utc;
@@ -70,8 +70,17 @@ impl Index {
         &'a self,
         query_plan: &QueryPlan,
     ) -> Result<QueryResult<'a>, AggregationError> {
-        let events = self.apply_query(&query_plan.query);
+        let mut events = self.apply_query(&query_plan.query);
         let Some(aggregation) = &query_plan.aggregation else {
+            // Events are in ascending chronological (insertion) order, so
+            // Head keeps the first n and Tail keeps the last n, still ascending.
+            match query_plan.limit {
+                Some(Limit::Head(n)) => events.truncate(n),
+                Some(Limit::Tail(n)) if events.len() > n => {
+                    events.drain(..events.len() - n);
+                }
+                _ => {}
+            }
             return Ok(QueryResult::Events(events));
         };
 
@@ -1007,7 +1016,7 @@ mod tests {
     // --- Aggregations ---
 
     fn make_plan(query: Query, aggregation: Option<Aggregation>) -> QueryPlan {
-        QueryPlan::new(query, aggregation)
+        QueryPlan::new(query, aggregation, None)
     }
 
     fn eq(field: &str, value: Value) -> Query {
@@ -1306,6 +1315,86 @@ mod tests {
             idx.apply_query_plan(&plan),
             Err(AggregationError::IncompatibleType(_))
         ));
+    }
+
+    // --- Limits ---
+
+    fn level_index() -> Index {
+        let mut idx = Index::new(None);
+        for (raw, level) in [
+            ("e1", "error"),
+            ("e2", "info"),
+            ("e3", "error"),
+            ("e4", "error"),
+            ("e5", "error"),
+        ] {
+            idx.push_event(make_event_raw(
+                raw,
+                vec![("level", Value::String(level.into()))],
+            ));
+        }
+        idx
+    }
+
+    fn result_raws<'a>(result: QueryResult<'a>) -> Vec<&'a str> {
+        match result {
+            QueryResult::Events(events) => events.iter().map(|e| e.raw.as_str()).collect(),
+            other => panic!("expected events, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_limit_head_truncates_to_first_n() {
+        let idx = level_index();
+        let plan = QueryPlan::new(
+            eq("level", Value::String("error".into())),
+            None,
+            Some(Limit::Head(2)),
+        );
+        assert_eq!(
+            result_raws(idx.apply_query_plan(&plan).unwrap()),
+            vec!["e1", "e3"]
+        );
+    }
+
+    #[test]
+    fn test_limit_tail_keeps_last_n_ascending() {
+        let idx = level_index();
+        let plan = QueryPlan::new(
+            eq("level", Value::String("error".into())),
+            None,
+            Some(Limit::Tail(2)),
+        );
+        assert_eq!(
+            result_raws(idx.apply_query_plan(&plan).unwrap()),
+            vec!["e4", "e5"]
+        );
+    }
+
+    #[test]
+    fn test_limit_larger_than_results_returns_all() {
+        let idx = level_index();
+        for limit in [Limit::Head(10), Limit::Tail(10)] {
+            let plan = QueryPlan::new(
+                eq("level", Value::String("error".into())),
+                None,
+                Some(limit),
+            );
+            assert_eq!(
+                result_raws(idx.apply_query_plan(&plan).unwrap()),
+                vec!["e1", "e3", "e4", "e5"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_limit_returns_all_matches() {
+        let idx = level_index();
+        let plan = QueryPlan::new(eq("level", Value::String("error".into())), None, None);
+        assert_eq!(
+            result_raws(idx.apply_query_plan(&plan).unwrap()),
+            vec!["e1", "e3", "e4", "e5"]
+        );
     }
 
     // --- Bounded memory / retention ---

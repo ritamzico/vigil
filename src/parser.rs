@@ -1,5 +1,5 @@
 use crate::parser::ParseError::{IncorrectFormat, UnknownOperator};
-use crate::query::{Aggregation, ComparisonOp, Query, QueryPlan};
+use crate::query::{Aggregation, ComparisonOp, Limit, Query, QueryPlan};
 use crate::value::Value;
 use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
@@ -51,23 +51,58 @@ pub fn parse_query(query_string: &str, time_field: Option<&str>) -> Result<Query
         .ok_or_else(|| IncorrectFormat(String::from("empty query")))?
         == "|"
     {
-        let aggregation = parse_aggregation(&tokens, 1)?;
-        return Ok(QueryPlan::new(Query::All(), aggregation));
+        let (aggregation, limit) = parse_pipeline(&tokens, 1)?;
+        return Ok(QueryPlan::new(Query::All(), aggregation, limit));
     }
 
     let (query, pos) = parse_or(&tokens, 0, time_field)?;
 
     if pos == tokens.len() {
-        return Ok(QueryPlan::new(query, None));
+        return Ok(QueryPlan::new(query, None, None));
     }
 
     if tokens[pos] != "|" {
         return Err(unexpected_token(&tokens, pos));
     }
 
-    let aggregation = parse_aggregation(&tokens, pos + 1)?;
+    let (aggregation, limit) = parse_pipeline(&tokens, pos + 1)?;
 
-    Ok(QueryPlan::new(query, aggregation))
+    Ok(QueryPlan::new(query, aggregation, limit))
+}
+
+// pipeline = limit_stage | aggregation  (mutually exclusive for 0.1.0)
+fn parse_pipeline(
+    tokens: &[&str],
+    pos: usize,
+) -> Result<(Option<Aggregation>, Option<Limit>), ParseError> {
+    match tokens
+        .get(pos)
+        .ok_or_else(|| IncorrectFormat(String::from("no aggregator after '|'")))?
+        .to_lowercase()
+        .as_str()
+    {
+        stage @ ("limit" | "tail") => {
+            let count_token = tokens.get(pos + 1).ok_or_else(|| {
+                IncorrectFormat(format!("'{}' requires a count, e.g.: {} 10", stage, stage))
+            })?;
+
+            let count: usize = count_token
+                .parse()
+                .map_err(|_| IncorrectFormat(format!("invalid count '{}'", count_token)))?;
+
+            if tokens.get(pos + 2).is_some() {
+                return Err(unexpected_token(tokens, pos + 2));
+            }
+
+            let limit = if stage == "limit" {
+                Limit::Head(count)
+            } else {
+                Limit::Tail(count)
+            };
+            Ok((None, Some(limit)))
+        }
+        _ => Ok((parse_aggregation(tokens, pos)?, None)),
+    }
 }
 
 fn parse_aggregation(tokens: &[&str], pos: usize) -> Result<Option<Aggregation>, ParseError> {
@@ -1027,6 +1062,87 @@ mod tests {
     fn test_error_p_no_digits() {
         assert!(matches!(
             parse_query("status = 500 | p latency_ms", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    // --- Limits ---
+
+    #[test]
+    fn test_limit_parses_head() {
+        let plan = parse_query("level = ERROR | limit 20", None).unwrap();
+        assert_eq!(
+            plan.query,
+            field("level", ComparisonOp::Eq, Value::String("ERROR".into()))
+        );
+        assert!(plan.aggregation.is_none());
+        assert_eq!(plan.limit, Some(Limit::Head(20)));
+    }
+
+    #[test]
+    fn test_tail_parses_tail() {
+        let plan = parse_query("level = ERROR | tail 5", None).unwrap();
+        assert!(plan.aggregation.is_none());
+        assert_eq!(plan.limit, Some(Limit::Tail(5)));
+    }
+
+    #[test]
+    fn test_limit_without_filter_matches_all() {
+        let plan = parse_query("| limit 5", None).unwrap();
+        assert_eq!(plan.query, Query::All());
+        assert!(plan.aggregation.is_none());
+        assert_eq!(plan.limit, Some(Limit::Head(5)));
+    }
+
+    #[test]
+    fn test_limit_case_insensitive() {
+        let plan = parse_query("level = ERROR | LIMIT 3", None).unwrap();
+        assert_eq!(plan.limit, Some(Limit::Head(3)));
+
+        let plan = parse_query("level = ERROR | Tail 3", None).unwrap();
+        assert_eq!(plan.limit, Some(Limit::Tail(3)));
+    }
+
+    #[test]
+    fn test_aggregation_leaves_limit_none() {
+        let plan = parse_query("status = 500 | count", None).unwrap();
+        assert!(plan.limit.is_none());
+    }
+
+    #[test]
+    fn test_no_pipeline_leaves_limit_none() {
+        let plan = parse_query("status = 500", None).unwrap();
+        assert!(plan.limit.is_none());
+    }
+
+    #[test]
+    fn test_error_limit_missing_count() {
+        assert!(matches!(
+            parse_query("status = 500 | limit", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_tail_missing_count() {
+        assert!(matches!(
+            parse_query("status = 500 | tail", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_limit_non_numeric_count() {
+        assert!(matches!(
+            parse_query("status = 500 | limit five", None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_error_limit_trailing_token() {
+        assert!(matches!(
+            parse_query("status = 500 | limit 5 extra", None),
             Err(ParseError::IncorrectFormat(_))
         ));
     }
