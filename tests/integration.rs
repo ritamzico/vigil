@@ -321,6 +321,38 @@ fn test_new_events_are_picked_up() {
     assert!(stdout(&out).contains(r#""id":42"#));
 }
 
+// --- Robustness ---
+
+#[test]
+fn test_malformed_line_while_tailing_does_not_kill_daemon() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[r#"{"level":"INFO"}"#]);
+
+    // A plain-text line (e.g. a stack trace) lands in the log mid-tail.
+    daemon.append("not json: something panicked here");
+    daemon.append(r#"{"level":"ERROR","id":7}"#);
+
+    // The daemon skipped the bad line and kept ingesting.
+    let out = daemon.query("level = ERROR");
+    assert!(out.status.success(), "daemon died after malformed line");
+    assert!(stdout(&out).contains(r#""id":7"#));
+}
+
+#[test]
+fn test_socket_permissions_restricted_to_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = LOCK.lock().unwrap();
+    let _daemon = Daemon::start(&[]);
+
+    let mode = std::fs::metadata(SOCKET).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "socket must not be accessible to other users"
+    );
+}
+
 // --- Errors ---
 
 #[test]

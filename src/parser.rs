@@ -17,6 +17,11 @@ fn unexpected_token(tokens: &[&str], pos: usize) -> ParseError {
     IncorrectFormat(format!("unexpected token '{}'", tokens[pos]))
 }
 
+// The parser recurses once per '(' — cap the nesting so a hostile query
+// (e.g. megabytes of open parens) can't overflow the stack and abort the
+// daemon.
+const MAX_NESTING_DEPTH: usize = 128;
+
 // Splits on whitespace, with '(' and ')' as their own tokens even when not
 // surrounded by spaces, e.g. "(a = 1)" -> ["(", "a", "=", "1", ")"].
 fn tokenize(query_string: &str) -> Vec<String> {
@@ -55,7 +60,7 @@ pub fn parse_query(query_string: &str, time_field: Option<&str>) -> Result<Query
         return Ok(QueryPlan::new(Query::All(), aggregation, limit));
     }
 
-    let (query, pos) = parse_or(&tokens, 0, time_field)?;
+    let (query, pos) = parse_or(&tokens, 0, time_field, 0)?;
 
     if pos == tokens.len() {
         return Ok(QueryPlan::new(query, None, None));
@@ -179,12 +184,12 @@ fn parse_aggregation(tokens: &[&str], pos: usize) -> Result<Option<Aggregation>,
 }
 
 // or_expr = and_expr ("OR" and_expr)*
-fn parse_or(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Query, usize), ParseError> {
-    let (first, mut pos) = parse_and(tokens, pos, time_field)?;
+fn parse_or(tokens: &[&str], pos: usize, time_field: Option<&str>, depth: usize) -> Result<(Query, usize), ParseError> {
+    let (first, mut pos) = parse_and(tokens, pos, time_field, depth)?;
     let mut parts = vec![first];
 
     while tokens.get(pos) == Some(&"OR") {
-        let (next, new_pos) = parse_and(tokens, pos + 1, time_field)?;
+        let (next, new_pos) = parse_and(tokens, pos + 1, time_field, depth)?;
         parts.push(next);
         pos = new_pos;
     }
@@ -197,12 +202,12 @@ fn parse_or(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Qu
 }
 
 // and_expr = not_expr ("AND" not_expr)*
-fn parse_and(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Query, usize), ParseError> {
-    let (first, mut pos) = parse_not(tokens, pos, time_field)?;
+fn parse_and(tokens: &[&str], pos: usize, time_field: Option<&str>, depth: usize) -> Result<(Query, usize), ParseError> {
+    let (first, mut pos) = parse_not(tokens, pos, time_field, depth)?;
     let mut parts = vec![first];
 
     while tokens.get(pos) == Some(&"AND") {
-        let (next, new_pos) = parse_not(tokens, pos + 1, time_field)?;
+        let (next, new_pos) = parse_not(tokens, pos + 1, time_field, depth)?;
         parts.push(next);
         pos = new_pos;
     }
@@ -215,19 +220,24 @@ fn parse_and(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Q
 }
 
 // not_expr = "NOT"? primary
-fn parse_not(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Query, usize), ParseError> {
+fn parse_not(tokens: &[&str], pos: usize, time_field: Option<&str>, depth: usize) -> Result<(Query, usize), ParseError> {
     if tokens.get(pos) == Some(&"NOT") {
-        let (query, pos) = parse_primary(tokens, pos + 1, time_field)?;
+        let (query, pos) = parse_primary(tokens, pos + 1, time_field, depth)?;
         Ok((Query::Not(Box::new(query)), pos))
     } else {
-        parse_primary(tokens, pos, time_field)
+        parse_primary(tokens, pos, time_field, depth)
     }
 }
 
 // primary = "(" or_expr ")" | simple_expr
-fn parse_primary(tokens: &[&str], pos: usize, time_field: Option<&str>) -> Result<(Query, usize), ParseError> {
+fn parse_primary(tokens: &[&str], pos: usize, time_field: Option<&str>, depth: usize) -> Result<(Query, usize), ParseError> {
     if tokens.get(pos) == Some(&"(") {
-        let (query, pos) = parse_or(tokens, pos + 1, time_field)?;
+        if depth >= MAX_NESTING_DEPTH {
+            return Err(IncorrectFormat(String::from(
+                "query nesting too deep",
+            )));
+        }
+        let (query, pos) = parse_or(tokens, pos + 1, time_field, depth + 1)?;
 
         if tokens.get(pos) != Some(&")") {
             return Err(IncorrectFormat(String::from("expected ')'")));
@@ -826,6 +836,22 @@ mod tests {
             parse_query("a = 1)", None),
             Err(ParseError::IncorrectFormat(_))
         ));
+    }
+
+    #[test]
+    fn test_error_deeply_nested_parens_rejected_not_stack_overflow() {
+        // 100K nested parens used to blow the stack and abort the process.
+        let query = format!("{}a = 1{}", "(".repeat(100_000), ")".repeat(100_000));
+        assert!(matches!(
+            parse_query(&query, None),
+            Err(ParseError::IncorrectFormat(_))
+        ));
+    }
+
+    #[test]
+    fn test_nesting_below_depth_cap_still_parses() {
+        let query = format!("{}a = 1{}", "(".repeat(64), ")".repeat(64));
+        assert!(parse_query(&query, None).is_ok());
     }
 
     #[test]

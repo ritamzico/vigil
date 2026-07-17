@@ -5,9 +5,19 @@ use tokio::{
     fs::OpenOptions,
     io::{self, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
 };
-use wincode::{serialize, SchemaRead, SchemaWrite};
+use wincode::{
+    config::{deserialize, serialize, Configuration},
+    SchemaRead, SchemaWrite,
+};
 
 use crate::event::PersistedEvent;
+
+// Payloads are CRC-verified before deserialization, so a corrupt length can't
+// reach the decoder — safe to lift wincode's 4 MiB preallocation cap, which a
+// single legitimate large record (e.g. a multi-MiB log line) would exceed.
+fn wal_config() -> Configuration<true, { usize::MAX }> {
+    Configuration::default().disable_preallocation_size_limit()
+}
 
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
 pub struct WALRecord {
@@ -52,8 +62,8 @@ impl WAL {
     pub async fn append(&mut self, byte_offset: u64, event: PersistedEvent) -> io::Result<()> {
         let record = &WALRecord::new(self.next_seq, byte_offset, event);
 
-        let payload =
-            serialize(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let payload = serialize(record, wal_config())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let crc = crc32fast::hash(&payload);
 
         self.writer
@@ -75,8 +85,21 @@ impl WAL {
         Ok(())
     }
 
+    /// Read back every intact record from the start of the log.
+    ///
+    /// A crash can tear the last record (short write, or blocks that never hit
+    /// disk before fsync). Anything after the last intact record is dropped
+    /// and the file is truncated back to the intact prefix, so future appends
+    /// land where the next replay will actually read them.
     pub async fn replay(&mut self) -> io::Result<Vec<WALRecord>> {
         let mut records = vec![];
+
+        self.writer.flush().await?;
+        let file_len = self.writer.get_ref().metadata().await?.len();
+        self.reader.seek(io::SeekFrom::Start(0)).await?;
+
+        // Byte offset of the end of the last intact record.
+        let mut valid_len: u64 = 0;
 
         loop {
             let mut len_bytes = [0u8; 4];
@@ -86,6 +109,13 @@ impl WAL {
                 _ => {}
             }
             let payload_len = u32::from_le_bytes(len_bytes);
+
+            // A record that claims to extend past the end of the file is a
+            // torn tail. Checking up front also stops a corrupt length from
+            // preallocating gigabytes below.
+            if valid_len + 4 + payload_len as u64 + 4 > file_len {
+                break;
+            }
 
             let mut payload = vec![0u8; payload_len as usize];
             match self.reader.read_exact(&mut payload).await {
@@ -103,12 +133,25 @@ impl WAL {
             let expected_crc = u32::from_le_bytes(crc_bytes);
             let actual_crc = crc32fast::hash(&payload);
             if expected_crc != actual_crc {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch"));
+                break;
             }
 
-            let record = wincode::deserialize(&payload)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let record = match deserialize(&payload, wal_config()) {
+                Ok(record) => record,
+                Err(_) => break,
+            };
             records.push(record);
+            valid_len += 4 + payload.len() as u64 + 4;
+        }
+
+        if file_len > valid_len {
+            eprintln!(
+                "WAL: dropping {} bytes of torn or corrupt data after the last intact record",
+                file_len - valid_len
+            );
+            self.writer.get_ref().set_len(valid_len).await?;
+            self.writer.get_ref().sync_data().await?;
+            self.reader.seek(io::SeekFrom::Start(valid_len)).await?;
         }
 
         Ok(records)
@@ -193,7 +236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_crc_corruption_returns_error() {
+    async fn test_crc_corruption_drops_corrupt_record_and_truncates() {
         let tmp = NamedTempFile::new().unwrap();
         {
             let mut wal = WAL::open(tmp.path(), None).await.unwrap();
@@ -208,8 +251,85 @@ mod tests {
         tokio::fs::write(tmp.path(), &bytes).await.unwrap();
 
         let mut wal = WAL::open(tmp.path(), None).await.unwrap();
-        let result = wal.replay().await;
-        assert!(result.is_err());
+        let records = wal.replay().await.unwrap();
+        assert!(records.is_empty());
+
+        // The corrupt tail is gone from disk, so future appends stay readable.
+        let len = tokio::fs::metadata(tmp.path()).await.unwrap().len();
+        assert_eq!(len, 0);
+    }
+
+    #[tokio::test]
+    async fn test_torn_tail_keeps_intact_prefix() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+            wal.append(0, make_event("good-0")).await.unwrap();
+            wal.append(10, make_event("good-1")).await.unwrap();
+            wal.flush_fsync().await.unwrap();
+        }
+        let intact_len = tokio::fs::metadata(tmp.path()).await.unwrap().len();
+
+        // Simulate a crash mid-append: a length prefix that claims more bytes
+        // than the file holds, followed by a short payload.
+        let mut bytes = tokio::fs::read(tmp.path()).await.unwrap();
+        bytes.extend_from_slice(&1000u32.to_le_bytes());
+        bytes.extend_from_slice(b"partial");
+        tokio::fs::write(tmp.path(), &bytes).await.unwrap();
+
+        let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+        let records = wal.replay().await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].event, make_event("good-0"));
+        assert_eq!(records[1].event, make_event("good-1"));
+
+        // Torn bytes were truncated away.
+        let len = tokio::fs::metadata(tmp.path()).await.unwrap().len();
+        assert_eq!(len, intact_len);
+    }
+
+    #[tokio::test]
+    async fn test_appends_after_torn_tail_recovery_survive_next_replay() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+            wal.append(0, make_event("good")).await.unwrap();
+            wal.flush_fsync().await.unwrap();
+        }
+
+        // Torn tail: garbage length prefix + short payload.
+        let mut bytes = tokio::fs::read(tmp.path()).await.unwrap();
+        bytes.extend_from_slice(&(u32::MAX).to_le_bytes());
+        bytes.extend_from_slice(b"xx");
+        tokio::fs::write(tmp.path(), &bytes).await.unwrap();
+
+        // First recovery drops the torn tail, then the daemon keeps appending.
+        let mut wal = WAL::open(tmp.path(), Some(1)).await.unwrap();
+        let records = wal.replay().await.unwrap();
+        assert_eq!(records.len(), 1);
+        wal.append(20, make_event("after-recovery")).await.unwrap();
+        wal.flush_fsync().await.unwrap();
+
+        // A later recovery must see both records — nothing written after the
+        // truncation may be lost.
+        let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+        let records = wal.replay().await.unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].event, make_event("after-recovery"));
+    }
+
+    #[tokio::test]
+    async fn test_large_record_exceeding_prealloc_cap_replays() {
+        let (mut wal, _tmp) = open_temp_wal().await;
+
+        // A single record bigger than wincode's default 4 MiB prealloc cap.
+        let big = "x".repeat(5 * 1024 * 1024);
+        wal.append(0, make_event(&big)).await.unwrap();
+        wal.flush_fsync().await.unwrap();
+
+        let records = wal.replay().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event, make_event(&big));
     }
 
     #[tokio::test]

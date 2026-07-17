@@ -174,6 +174,17 @@ async fn run_daemon(
         };
 
     let listener = UnixListener::bind(message::SOCKET_PATH).unwrap();
+    // The socket accepts queries and shutdown/watch commands — only the owner
+    // may talk to it.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(
+            message::SOCKET_PATH,
+            std::fs::Permissions::from_mode(0o600),
+        ) {
+            eprintln!("Failed to restrict socket permissions: {e}");
+        }
+    }
 
     let mut tailer_handle = tokio::spawn(tailer::run_tailer(
         file_path,
@@ -223,16 +234,25 @@ async fn run_daemon(
                 );
             }
             Ok((stream, _)) = listener.accept() => {
-                let client_handle = tokio::spawn(handler::handle_client(
-                    stream,
-                    index.clone(),
-                    shutdown_tx.clone(),
-                    watch_tx.clone(),
-                    current_time_field.clone(),
-                ));
-                if let Err(e) = client_handle.await.unwrap() {
-                    eprintln!("Client error: {e}");
-                }
+                // Handle the client in its own task: a slow or stalled client
+                // must not block the accept loop (or shutdown) behind it.
+                let client_index = index.clone();
+                let client_shutdown_tx = shutdown_tx.clone();
+                let client_watch_tx = watch_tx.clone();
+                let client_time_field = current_time_field.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handler::handle_client(
+                        stream,
+                        client_index,
+                        client_shutdown_tx,
+                        client_watch_tx,
+                        client_time_field,
+                    )
+                    .await
+                    {
+                        eprintln!("Client error: {e}");
+                    }
+                });
             }
             _ = shutdown_rx.recv() => {
                 flush_handle.abort();
