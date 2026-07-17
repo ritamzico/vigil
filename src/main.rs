@@ -10,9 +10,11 @@ use std::sync::RwLock;
 use std::time::Duration;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
+use crate::event::Event;
 use crate::index::Index;
 use crate::recover::data_dir;
 use crate::recover::recover;
@@ -60,6 +62,9 @@ struct Args {
     #[arg(long)]
     max_events: Option<usize>,
 
+    #[arg(short, long)]
+    follow: bool,
+
     query: Option<String>,
 }
 
@@ -68,9 +73,9 @@ async fn main() {
     let args = Args::parse();
     let time_field = args.time_field;
 
-    match (args.watch, args.query, args.stop, args.detach) {
-        (_, _, true, _) => run_stop().await,
-        (Some(path), None, false, detach) => {
+    match (args.watch, args.query, args.stop, args.detach, args.follow) {
+        (_, _, true, _, false) => run_stop().await,
+        (Some(path), None, false, detach, false) => {
             run_daemon(
                 path,
                 detach,
@@ -83,9 +88,10 @@ async fn main() {
             )
             .await
         }
-        (None, Some(q), false, _) => run_query(q).await,
+        (None, Some(q), false, _, false) => run_query(q).await,
+        (None, Some(q), false, _, true) => run_follow(q).await,
         _ => {
-            eprintln!("Usage: vigil --watch <file> [--time-field <field>] [-d]  |  vigil \"<query>\"  |  vigil --stop");
+            eprintln!("Usage: vigil --watch <file> [--time-field <field>] [-d]  |  vigil \"<query>\"  |  vigil -f \"<query>\"  |  vigil --stop");
             std::process::exit(1);
         }
     }
@@ -175,12 +181,15 @@ async fn run_daemon(
 
     let listener = UnixListener::bind(message::SOCKET_PATH).unwrap();
 
+    let (follow_tx, _) = broadcast::channel::<Arc<Event>>(1024);
+
     let mut tailer_handle = tokio::spawn(tailer::run_tailer(
         file_path,
         index.clone(),
         time_field.clone(),
         wal.clone(),
         byte_offset,
+        follow_tx.clone(),
     ));
     let mut flush_handle = spawn_flush_task(&wal, fsync_interval);
     let mut checkpoint_handle = spawn_checkpoint_task(
@@ -223,16 +232,21 @@ async fn run_daemon(
                 );
             }
             Ok((stream, _)) = listener.accept() => {
-                let client_handle = tokio::spawn(handler::handle_client(
+                // Spawned without awaiting: a long-lived follow client must not
+                // block the accept loop, new connections, or shutdown handling.
+                let client = handler::handle_client(
                     stream,
                     index.clone(),
                     shutdown_tx.clone(),
                     watch_tx.clone(),
                     current_time_field.clone(),
-                ));
-                if let Err(e) = client_handle.await.unwrap() {
-                    eprintln!("Client error: {e}");
-                }
+                    follow_tx.clone(),
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = client.await {
+                        eprintln!("Client error: {e}");
+                    }
+                });
             }
             _ = shutdown_rx.recv() => {
                 flush_handle.abort();
@@ -276,6 +290,7 @@ async fn run_daemon(
                     new_time_field,
                     wal.clone(),
                     new_byte_offset,
+                    follow_tx.clone(),
                 ));
                 flush_handle = spawn_flush_task(&wal, fsync_interval);
                 checkpoint_handle = spawn_checkpoint_task(
@@ -407,6 +422,38 @@ async fn run_stop() {
             eprintln!("Unexpected response from daemon.");
             std::process::exit(1);
         }
+    }
+}
+
+async fn run_follow(raw_query: String) {
+    let stream = match UnixStream::connect(message::SOCKET_PATH).await {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("Failed to connect to daemon. Check if the daemon is running.");
+            std::process::exit(1);
+        }
+    };
+
+    let (mut reader, mut writer) = stream.into_split();
+    let message = Message::new(MessageKind::Follow, raw_query);
+    let bytes = to_vec(&message).unwrap();
+
+    match writer.write_all(&bytes).await {
+        Ok(()) => {
+            writer.shutdown().await.unwrap();
+        }
+        Err(_) => {
+            eprintln!("Failed to write to daemon.");
+            std::process::exit(1);
+        }
+    }
+
+    // Stream raw matching lines to stdout until the daemon closes the
+    // connection or we're interrupted (Ctrl-C).
+    let mut stdout = io::stdout();
+    if let Err(e) = io::copy(&mut reader, &mut stdout).await {
+        eprintln!("Connection error: {e}");
+        std::process::exit(1);
     }
 }
 

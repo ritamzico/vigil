@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use wincode::{SchemaRead, SchemaWrite};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Event {
     pub timestamp: Option<DateTime<Utc>>,
     pub raw: String,

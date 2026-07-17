@@ -6,6 +6,7 @@ A fast, queryable log watcher for structured JSON logs. Run it as a daemon point
 vigil --watch app.log --time-field timestamp
 vigil "level = ERROR AND status >= 500 | count"
 vigil "level = ERROR | p99 latency_ms"
+vigil -f "level = ERROR"
 ```
 
 ## How it works
@@ -56,6 +57,26 @@ vigil "<query>"
 ```
 
 Queries are sent to the running daemon. Results are printed to stdout, one raw log line per result (or a single number for aggregations).
+
+### Follow (live queries)
+
+```
+vigil -f "<query>"
+```
+
+A `tail -f | grep` workflow: the daemon streams each newly ingested event that matches the filter to your terminal as a raw log line, as it is appended to the watched file. The stream continues until you interrupt it (Ctrl-C) or the daemon stops.
+
+Follow supports **filters only** — no `|` aggregation stages. `vigil -f "level = ERROR | count"` is rejected.
+
+```sh
+# Stream new errors as they arrive
+vigil -f "level = ERROR"
+
+# Combine filters as usual
+vigil -f "status >= 500 AND method = POST"
+```
+
+Follow only sees events ingested after it starts; use a normal query for history.
 
 ### Stop the daemon
 
