@@ -1,6 +1,7 @@
 use std::hash::{Hash, Hasher};
+use wincode::{SchemaRead, SchemaWrite};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, SchemaRead, SchemaWrite)]
 pub enum Value {
     String(String),
     Number(f32),

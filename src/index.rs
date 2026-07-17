@@ -1,5 +1,5 @@
 use crate::event::Event;
-use crate::query::{Aggregation, ComparisonOp, Query, QueryPlan, QueryResult};
+use crate::query::{Aggregation, ComparisonOp, Limit, Query, QueryPlan, QueryResult};
 use crate::value::Value;
 use chrono::DateTime;
 use chrono::Utc;
@@ -9,6 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Bound::{Included, Unbounded};
 use thiserror::Error;
+
+const SLACK: usize = 1024;
+const DEFAULT_MAX_EVENTS: usize = 2_000_000;
 
 #[derive(Debug, Error)]
 pub enum AggregationError {
@@ -23,42 +26,39 @@ pub enum AggregationError {
 }
 
 pub struct Index {
-    events: Vec<Event>,
+    pub events: Vec<Event>,
     field_index: HashMap<String, HashMap<Value, Vec<usize>>>,
     time_index: BTreeMap<DateTime<Utc>, Vec<usize>>,
+    max_events: usize,
 }
 
 impl fmt::Display for Index {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for event in &self.events {
-            writeln!(f, "{}", event.get_raw())?;
+            writeln!(f, "{}", event.raw)?;
         }
         Ok(())
     }
 }
 
 impl Index {
-    pub fn new() -> Index {
+    pub fn new(max_events: Option<usize>) -> Index {
         Index {
             events: vec![],
             field_index: HashMap::new(),
             time_index: BTreeMap::new(),
+            max_events: max_events.unwrap_or(DEFAULT_MAX_EVENTS),
         }
     }
 
     pub fn push_event(&mut self, event: Event) {
-        let i = self.events.len();
-
-        for (field, value) in event.get_fields() {
-            let field_map = self.field_index.entry(field.clone()).or_default();
-            field_map.entry(value.clone()).or_default().push(i);
-        }
-
-        if let Some(timestamp) = *event.get_timestamp() {
-            self.time_index.entry(timestamp).or_default().push(i);
-        }
-
+        self.push_to_field_and_time_index(self.events.len(), &event);
         self.events.push(event);
+
+        if self.events.len() > self.max_events + SLACK {
+            self.events.drain(0..self.events.len() - self.max_events);
+            self.reindex();
+        }
     }
 
     #[cfg(test)]
@@ -70,63 +70,70 @@ impl Index {
         &'a self,
         query_plan: &QueryPlan,
     ) -> Result<QueryResult<'a>, AggregationError> {
-        let events = self.apply_query(query_plan.get_query());
-        let Some(aggregation) = query_plan.get_aggregation() else {
+        let mut events = self.apply_query(&query_plan.query);
+        let Some(aggregation) = &query_plan.aggregation else {
+            // Events are in ascending chronological (insertion) order, so
+            // Head keeps the first n and Tail keeps the last n, still ascending.
+            match query_plan.limit {
+                Some(Limit::Head(n)) => events.truncate(n),
+                Some(Limit::Tail(n)) if events.len() > n => {
+                    events.drain(..events.len() - n);
+                }
+                _ => {}
+            }
             return Ok(QueryResult::Events(events));
         };
 
         match aggregation {
             Aggregation::Count => Ok(QueryResult::Count(events.len())),
             Aggregation::Average(field) => {
-                if events.is_empty() {
-                    return Err(AggregationError::NoMatchingEvents);
-                }
-
-                let values: Vec<f32> = events
-                    .iter()
-                    .filter_map(|event| event.get_fields().get(field))
-                    .map(|value| match value {
-                        Value::Number(n) => Ok(*n),
-                        _ => Err(AggregationError::IncompatibleType(field.clone())),
-                    })
-                    .collect::<Result<_, _>>()?;
-
+                let values = numeric_values(&events, field)?;
                 let total: f32 = values.iter().sum();
-                let count = values.len();
 
-                if count == 0 {
-                    return Err(AggregationError::FieldNotFound(field.clone()));
-                }
-
-                Ok(QueryResult::Average(total / count as f32))
+                Ok(QueryResult::Scalar(total / values.len() as f32))
             }
             Aggregation::Percentage(field, p) => {
                 if *p <= 0.0 || *p > 1.0 {
                     return Err(AggregationError::InvalidPercentile);
                 }
 
-                if events.is_empty() {
-                    return Err(AggregationError::NoMatchingEvents);
-                }
+                let mut values = numeric_values(&events, field)?;
 
-                let mut values: Vec<f32> = events
-                    .iter()
-                    .filter_map(|event| event.get_fields().get(field))
-                    .map(|value| match value {
-                        Value::Number(n) => Ok(*n),
-                        _ => Err(AggregationError::IncompatibleType(field.clone())),
-                    })
-                    .collect::<Result<Vec<f32>, _>>()?;
-
-                values.sort_by(|a, b| a.total_cmp(b));
+                values.sort_by(f32::total_cmp);
                 let i = (*p * values.len() as f32).ceil() as usize - 1;
 
-                Ok(QueryResult::Percentage(values[i]))
+                Ok(QueryResult::Scalar(values[i]))
+            }
+            Aggregation::Sum(field) => {
+                let values = numeric_values(&events, field)?;
+
+                Ok(QueryResult::Scalar(values.iter().sum()))
+            }
+            Aggregation::Min(field) => {
+                let values = numeric_values(&events, field)?;
+
+                // numeric_values guarantees at least one value
+                Ok(QueryResult::Scalar(
+                    values
+                        .into_iter()
+                        .reduce(|a, b| if b.total_cmp(&a).is_lt() { b } else { a })
+                        .unwrap(),
+                ))
+            }
+            Aggregation::Max(field) => {
+                let values = numeric_values(&events, field)?;
+
+                Ok(QueryResult::Scalar(
+                    values
+                        .into_iter()
+                        .reduce(|a, b| if b.total_cmp(&a).is_gt() { b } else { a })
+                        .unwrap(),
+                ))
             }
             Aggregation::CountBy(field) => Ok(QueryResult::CountBy(
                 events
                     .iter()
-                    .filter(|event| event.get_fields().contains_key(field))
+                    .filter(|event| event.fields.contains_key(field))
                     .collect::<Vec<&&Event>>()
                     .len(),
             )),
@@ -134,58 +141,78 @@ impl Index {
     }
 
     pub fn apply_query<'a>(&'a self, query: &Query) -> Vec<&'a Event> {
-        match query {
-            Query::FieldComparison { .. } | Query::TimeRange { .. } => {
-                self.apply_simple_query(query)
-            }
-            Query::And(queries) => self.apply_and(&queries),
-            Query::Or(queries) => self.apply_or(&queries),
-            Query::All() => self.events.iter().collect(),
-        }
+        self.matching_indices(query)
+            .into_iter()
+            .map(|i| &self.events[i])
+            .collect()
     }
 
-    fn apply_simple_query<'a>(&'a self, query: &Query) -> Vec<&'a Event> {
+    /// Positions into `events` matching `query`, sorted and de-duplicated —
+    /// results are always in insertion (chronological) order.
+    pub fn matching_indices(&self, query: &Query) -> Vec<usize> {
+        let mut indices = self.collect_indices(query);
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+
+    fn collect_indices(&self, query: &Query) -> Vec<usize> {
         match query {
             Query::FieldComparison { field, op, value } => {
-                self.apply_field_comparison(field, op, value)
+                self.field_comparison_indices(field, op, value)
             }
-            Query::TimeRange { start, end } => self.apply_time_range(start, end),
-            _ => panic!("Unknown Query variant"),
+            Query::TimeRange { start, end } => self.time_range_indices(start, end),
+            Query::And(queries) => self.and_indices(queries),
+            Query::Or(queries) => self.or_indices(queries),
+            Query::Not(query) => self.not_indices(query),
+            Query::All() => (0..self.events.len()).collect(),
         }
     }
 
-    fn apply_field_comparison(
+    fn push_to_field_and_time_index(&mut self, i: usize, event: &Event) {
+        for (field, value) in &event.fields {
+            let field_map = self.field_index.entry(field.clone()).or_default();
+            field_map.entry(value.clone()).or_default().push(i);
+        }
+
+        if let Some(timestamp) = event.timestamp {
+            self.time_index.entry(timestamp).or_default().push(i);
+        }
+    }
+
+    fn reindex(&mut self) {
+        self.field_index.clear();
+        self.time_index.clear();
+
+        let events = std::mem::take(&mut self.events);
+        for (i, event) in events.iter().enumerate() {
+            self.push_to_field_and_time_index(i, event);
+        }
+        self.events = events;
+    }
+
+    fn field_comparison_indices(
         &self,
         field: &String,
         op: &ComparisonOp,
         value: &Value,
-    ) -> Vec<&Event> {
+    ) -> Vec<usize> {
         let Some(field_map) = self.field_index.get(field) else {
             return vec![];
         };
 
-        let filter_field = |candidate: &Value| match *op {
-            ComparisonOp::Eq => candidate == value,
-            ComparisonOp::Ne => candidate != value,
-            ComparisonOp::Lt => candidate < value,
-            ComparisonOp::Le => candidate <= value,
-            ComparisonOp::Gt => candidate > value,
-            ComparisonOp::Ge => candidate >= value,
-        };
-
         field_map
             .iter()
-            .filter(|(candidate, _)| filter_field(candidate))
-            .flat_map(|(_, indices)| indices.iter())
-            .map(|&i| &self.events[i])
+            .filter(|(candidate, _)| compare(op, candidate, value))
+            .flat_map(|(_, indices)| indices.iter().copied())
             .collect()
     }
 
-    fn apply_time_range(
+    fn time_range_indices(
         &self,
         start: &Option<DateTime<Utc>>,
         end: &Option<DateTime<Utc>>,
-    ) -> Vec<&Event> {
+    ) -> Vec<usize> {
         let range = (
             match start {
                 Some(s) => Included(s),
@@ -199,18 +226,17 @@ impl Index {
 
         self.time_index
             .range(range)
-            .flat_map(|(_, indices)| indices.iter())
-            .map(|&i| &self.events[i])
+            .flat_map(|(_, indices)| indices.iter().copied())
             .collect()
     }
 
-    fn apply_and<'a>(&'a self, queries: &Vec<Query>) -> Vec<&'a Event> {
-        let all_events: Vec<Vec<&Event>> = queries
+    fn and_indices(&self, queries: &[Query]) -> Vec<usize> {
+        let all_indices: Vec<Vec<usize>> = queries
             .par_iter()
-            .map(|query| self.apply_simple_query(query))
+            .map(|query| self.collect_indices(query))
             .collect();
 
-        let sets: Vec<HashSet<&Event>> = all_events
+        let sets: Vec<HashSet<usize>> = all_indices
             .iter()
             .map(|v| v.iter().copied().collect())
             .collect();
@@ -218,24 +244,81 @@ impl Index {
 
         first
             .iter()
-            .filter(|item| sets[1..].iter().all(|s| s.contains(*item)))
-            .map(|item| *item)
+            .copied()
+            .filter(|i| sets[1..].iter().all(|s| s.contains(i)))
             .collect()
     }
 
-    fn apply_or<'a>(&'a self, queries: &Vec<Query>) -> Vec<&'a Event> {
-        let all_events: Vec<Vec<&Event>> = queries
+    fn not_indices(&self, query: &Query) -> Vec<usize> {
+        let matched: HashSet<usize> = self.collect_indices(query).into_iter().collect();
+
+        (0..self.events.len())
+            .filter(|i| !matched.contains(i))
+            .collect()
+    }
+
+    fn or_indices(&self, queries: &[Query]) -> Vec<usize> {
+        queries
             .par_iter()
-            .map(|query| self.apply_simple_query(query))
-            .collect();
-
-        all_events
-            .into_iter()
+            .map(|query| self.collect_indices(query))
             .flatten()
-            .collect::<HashSet<&Event>>()
-            .into_iter()
             .collect()
     }
+}
+
+pub fn compare(op: &ComparisonOp, candidate: &Value, value: &Value) -> bool {
+    match *op {
+        ComparisonOp::Eq => candidate == value,
+        ComparisonOp::Ne => candidate != value,
+        ComparisonOp::Lt => candidate < value,
+        ComparisonOp::Le => candidate <= value,
+        ComparisonOp::Gt => candidate > value,
+        ComparisonOp::Ge => candidate >= value,
+        ComparisonOp::Contains => matches!(
+            (candidate, value),
+            (Value::String(c), Value::String(v)) if c.contains(v.as_str())
+        ),
+    }
+}
+
+/// Evaluate `query` against a single event, mirroring the index path:
+/// a missing field (or missing timestamp for time ranges) is no match.
+pub fn event_matches(event: &Event, query: &Query) -> bool {
+    match query {
+        Query::FieldComparison { field, op, value } => match event.fields.get(field) {
+            Some(candidate) => compare(op, candidate, value),
+            None => false,
+        },
+        Query::TimeRange { start, end } => match event.timestamp {
+            Some(ts) => start.is_none_or(|s| ts >= s) && end.is_none_or(|e| ts <= e),
+            None => false,
+        },
+        Query::And(queries) => queries.iter().all(|q| event_matches(event, q)),
+        Query::Or(queries) => queries.iter().any(|q| event_matches(event, q)),
+        Query::Not(query) => !event_matches(event, query),
+        Query::All() => true,
+    }
+}
+
+fn numeric_values(events: &[&Event], field: &str) -> Result<Vec<f32>, AggregationError> {
+    if events.is_empty() {
+        return Err(AggregationError::NoMatchingEvents);
+    }
+
+    let values: Vec<f32> = events
+        .iter()
+        .filter_map(|event| event.fields.get(field))
+        .map(|value| match value {
+            Value::Number(n) => Ok(*n),
+            _ => Err(AggregationError::IncompatibleType(field.to_string())),
+        })
+        .collect::<Result<_, _>>()?;
+
+    if values.is_empty() {
+        return Err(AggregationError::FieldNotFound(field.to_string()));
+    }
+
+    Ok(values)
 }
 
 #[cfg(test)]
@@ -262,13 +345,13 @@ mod tests {
 
     #[test]
     fn test_event_count_empty() {
-        let idx = Index::new();
+        let idx = Index::new(None);
         assert_eq!(idx.event_count(), 0);
     }
 
     #[test]
     fn test_event_count_after_push() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![]));
         idx.push_event(make_event(None, vec![]));
         assert_eq!(idx.event_count(), 2);
@@ -276,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_field_eq_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
             vec![("level", Value::String("error".into()))],
@@ -296,7 +379,7 @@ mod tests {
 
     #[test]
     fn test_field_eq_no_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
             vec![("level", Value::String("info".into()))],
@@ -312,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_field_missing_returns_empty() {
-        let idx = Index::new();
+        let idx = Index::new(None);
         let q = Query::FieldComparison {
             field: "nonexistent".into(),
             op: ComparisonOp::Eq,
@@ -323,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_field_ne() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(
             None,
             vec![("level", Value::String("error".into()))],
@@ -343,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_field_gt_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(500.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(404.0))]));
@@ -358,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_field_lt_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(100.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(300.0))]));
@@ -373,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_field_ge_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(100.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(300.0))]));
@@ -388,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_field_le_number() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![("code", Value::Number(100.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(200.0))]));
         idx.push_event(make_event(None, vec![("code", Value::Number(300.0))]));
@@ -402,8 +485,60 @@ mod tests {
     }
 
     #[test]
+    fn test_field_contains_substring() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event(
+            None,
+            vec![(
+                "message",
+                Value::String("connection timeout after 30s".into()),
+            )],
+        ));
+        idx.push_event(make_event(
+            None,
+            vec![("message", Value::String("request ok".into()))],
+        ));
+
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("timeout".into()),
+        };
+        assert_eq!(result_count(idx.apply_query(&q)), 1);
+    }
+
+    #[test]
+    fn test_field_contains_no_match() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event(
+            None,
+            vec![("message", Value::String("request ok".into()))],
+        ));
+
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("timeout".into()),
+        };
+        assert_eq!(result_count(idx.apply_query(&q)), 0);
+    }
+
+    #[test]
+    fn test_field_contains_non_string_field_no_match() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event(None, vec![("status", Value::Number(500.0))]));
+
+        let q = Query::FieldComparison {
+            field: "status".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("500".into()),
+        };
+        assert_eq!(result_count(idx.apply_query(&q)), 0);
+    }
+
+    #[test]
     fn test_time_range_both_bounds() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 6, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 12, 31)), vec![]));
@@ -417,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_time_range_no_bounds() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2023, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
 
@@ -430,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_time_range_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2020, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2021, 1, 1)), vec![]));
 
@@ -443,7 +578,7 @@ mod tests {
 
     #[test]
     fn test_time_range_open_start() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2022, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
 
@@ -456,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_time_range_open_end() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(Some(ts(2022, 1, 1)), vec![]));
         idx.push_event(make_event(Some(ts(2024, 1, 1)), vec![]));
 
@@ -469,7 +604,7 @@ mod tests {
 
     #[test]
     fn test_event_without_timestamp_excluded_from_time_range() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event(None, vec![]));
 
         let q = Query::TimeRange {
@@ -491,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_and_two_field_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -531,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_and_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -564,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_and_all_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -597,7 +732,7 @@ mod tests {
 
     #[test]
     fn test_and_field_and_time_range() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(Event::new(
             Some(ts(2024, 6, 1)),
             "e1".to_string(),
@@ -638,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_or_disjoint_sets() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("error".into()))],
@@ -669,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_or_overlapping_sets_no_dedup() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![
@@ -703,7 +838,7 @@ mod tests {
 
     #[test]
     fn test_or_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("info".into()))],
@@ -726,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_or_all_match() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("error".into()))],
@@ -751,10 +886,153 @@ mod tests {
         assert_eq!(result_count(idx.apply_query(&q)), 2);
     }
 
+    // --- Not ---
+
+    #[test]
+    fn test_not_excludes_matches() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
+        idx.push_event(make_event_raw("e2", vec![("status", Value::Number(200.0))]));
+        idx.push_event(make_event_raw("e3", vec![("status", Value::Number(500.0))]));
+
+        let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e2"]);
+    }
+
+    #[test]
+    fn test_not_includes_events_missing_field() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![("level", Value::String("info".into()))],
+        ));
+
+        // The complement is over all events, so events without the field match too.
+        let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e2"]);
+    }
+
+    #[test]
+    fn test_not_no_matches_returns_all() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+        idx.push_event(make_event_raw("e2", vec![("status", Value::Number(404.0))]));
+
+        let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
+        assert_eq!(result_count(idx.apply_query(&q)), 2);
+    }
+
+    #[test]
+    fn test_and_with_not() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![
+                ("status", Value::Number(500.0)),
+                ("level", Value::String("info".into())),
+            ],
+        ));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![
+                ("status", Value::Number(500.0)),
+                ("level", Value::String("error".into())),
+            ],
+        ));
+        idx.push_event(make_event_raw(
+            "e3",
+            vec![
+                ("status", Value::Number(200.0)),
+                ("level", Value::String("error".into())),
+            ],
+        ));
+
+        let q = Query::And(vec![
+            eq("status", Value::Number(500.0)),
+            Query::Not(Box::new(eq("level", Value::String("info".into())))),
+        ]);
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e2"]);
+    }
+
+    // --- Ordering & matching_indices ---
+
+    #[test]
+    fn test_results_in_insertion_order() {
+        let mut idx = Index::new(None);
+        for (raw, level) in [
+            ("e1", "error"),
+            ("e2", "info"),
+            ("e3", "error"),
+            ("e4", "info"),
+            ("e5", "error"),
+        ] {
+            idx.push_event(make_event_raw(
+                raw,
+                vec![("level", Value::String(level.into()))],
+            ));
+        }
+
+        let q = Query::FieldComparison {
+            field: "level".into(),
+            op: ComparisonOp::Ne,
+            value: Value::String("info".into()),
+        };
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e1", "e3", "e5"]);
+    }
+
+    #[test]
+    fn test_or_containing_and() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("a", Value::Number(1.0)), ("b", Value::Number(2.0))],
+        ));
+        idx.push_event(make_event_raw("e2", vec![("c", Value::Number(3.0))]));
+        idx.push_event(make_event_raw("e3", vec![("a", Value::Number(1.0))]));
+
+        let q = Query::Or(vec![
+            Query::And(vec![
+                eq("a", Value::Number(1.0)),
+                eq("b", Value::Number(2.0)),
+            ]),
+            eq("c", Value::Number(3.0)),
+        ]);
+        let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
+        assert_eq!(raws, vec!["e1", "e2"]);
+    }
+
+    #[test]
+    fn test_matching_indices_sorted_deduped() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![
+                ("level", Value::String("error".into())),
+                ("service", Value::String("auth".into())),
+            ],
+        ));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![("level", Value::String("error".into()))],
+        ));
+
+        // e1 matches both arms of the OR — must appear once
+        let q = Query::Or(vec![
+            eq("level", Value::String("error".into())),
+            eq("service", Value::String("auth".into())),
+        ]);
+        assert_eq!(idx.matching_indices(&q), vec![0, 1]);
+    }
+
     // --- Aggregations ---
 
     fn make_plan(query: Query, aggregation: Option<Aggregation>) -> QueryPlan {
-        QueryPlan::new(query, aggregation)
+        QueryPlan::new(query, aggregation, None)
     }
 
     fn eq(field: &str, value: Value) -> Query {
@@ -767,7 +1045,7 @@ mod tests {
 
     #[test]
     fn test_count_basic() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
         idx.push_event(make_event_raw("e2", vec![("status", Value::Number(500.0))]));
         idx.push_event(make_event_raw("e3", vec![("status", Value::Number(200.0))]));
@@ -778,7 +1056,7 @@ mod tests {
 
     #[test]
     fn test_count_no_matches() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
 
         let plan = make_plan(eq("status", Value::Number(500.0)), Some(Aggregation::Count));
@@ -787,7 +1065,7 @@ mod tests {
 
     #[test]
     fn test_avg_basic() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("latency", Value::Number(100.0))],
@@ -811,13 +1089,13 @@ mod tests {
         );
         assert_eq!(
             idx.apply_query_plan(&plan).unwrap(),
-            QueryResult::Average(200.0)
+            QueryResult::Scalar(200.0)
         );
     }
 
     #[test]
     fn test_avg_skips_events_missing_field() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("latency", Value::Number(100.0))],
@@ -839,13 +1117,13 @@ mod tests {
         // average of 100 and 300 only, e3 skipped
         assert_eq!(
             idx.apply_query_plan(&plan).unwrap(),
-            QueryResult::Average(200.0)
+            QueryResult::Scalar(200.0)
         );
     }
 
     #[test]
     fn test_avg_error_no_matching_events() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
 
         let plan = make_plan(
@@ -860,7 +1138,7 @@ mod tests {
 
     #[test]
     fn test_avg_error_field_not_found() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("status", Value::Number(500.0))]));
 
         let plan = make_plan(
@@ -875,7 +1153,7 @@ mod tests {
 
     #[test]
     fn test_avg_error_incompatible_type_string() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw(
             "e1",
             vec![("level", Value::String("ERROR".into()))],
@@ -893,7 +1171,7 @@ mod tests {
 
     #[test]
     fn test_avg_error_incompatible_type_bool() {
-        let mut idx = Index::new();
+        let mut idx = Index::new(None);
         idx.push_event(make_event_raw("e1", vec![("active", Value::Bool(true))]));
 
         let plan = make_plan(
@@ -904,5 +1182,516 @@ mod tests {
             idx.apply_query_plan(&plan),
             Err(AggregationError::IncompatibleType(_))
         ));
+    }
+
+    fn latency_index() -> Index {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("latency", Value::Number(100.0))],
+        ));
+        idx.push_event(make_event_raw(
+            "e2",
+            vec![("latency", Value::Number(300.0))],
+        ));
+        idx.push_event(make_event_raw(
+            "e3",
+            vec![("latency", Value::Number(200.0))],
+        ));
+        idx
+    }
+
+    #[test]
+    fn test_sum_basic() {
+        let idx = latency_index();
+
+        let plan = make_plan(Query::All(), Some(Aggregation::Sum("latency".into())));
+        assert_eq!(
+            idx.apply_query_plan(&plan).unwrap(),
+            QueryResult::Scalar(600.0)
+        );
+    }
+
+    #[test]
+    fn test_min_basic() {
+        let idx = latency_index();
+
+        let plan = make_plan(Query::All(), Some(Aggregation::Min("latency".into())));
+        assert_eq!(
+            idx.apply_query_plan(&plan).unwrap(),
+            QueryResult::Scalar(100.0)
+        );
+    }
+
+    #[test]
+    fn test_max_basic() {
+        let idx = latency_index();
+
+        let plan = make_plan(Query::All(), Some(Aggregation::Max("latency".into())));
+        assert_eq!(
+            idx.apply_query_plan(&plan).unwrap(),
+            QueryResult::Scalar(300.0)
+        );
+    }
+
+    #[test]
+    fn test_sum_error_no_matching_events() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+
+        let plan = make_plan(
+            eq("status", Value::Number(500.0)),
+            Some(Aggregation::Sum("latency".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::NoMatchingEvents)
+        ));
+    }
+
+    #[test]
+    fn test_min_error_no_matching_events() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+
+        let plan = make_plan(
+            eq("status", Value::Number(500.0)),
+            Some(Aggregation::Min("latency".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::NoMatchingEvents)
+        ));
+    }
+
+    #[test]
+    fn test_max_error_no_matching_events() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw("e1", vec![("status", Value::Number(200.0))]));
+
+        let plan = make_plan(
+            eq("status", Value::Number(500.0)),
+            Some(Aggregation::Max("latency".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::NoMatchingEvents)
+        ));
+    }
+
+    #[test]
+    fn test_sum_error_incompatible_type() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("level", Value::String("ERROR".into()))],
+        ));
+
+        let plan = make_plan(
+            eq("level", Value::String("ERROR".into())),
+            Some(Aggregation::Sum("level".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::IncompatibleType(_))
+        ));
+    }
+
+    #[test]
+    fn test_min_error_incompatible_type() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("level", Value::String("ERROR".into()))],
+        ));
+
+        let plan = make_plan(
+            eq("level", Value::String("ERROR".into())),
+            Some(Aggregation::Min("level".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::IncompatibleType(_))
+        ));
+    }
+
+    #[test]
+    fn test_max_error_incompatible_type() {
+        let mut idx = Index::new(None);
+        idx.push_event(make_event_raw(
+            "e1",
+            vec![("level", Value::String("ERROR".into()))],
+        ));
+
+        let plan = make_plan(
+            eq("level", Value::String("ERROR".into())),
+            Some(Aggregation::Max("level".into())),
+        );
+        assert!(matches!(
+            idx.apply_query_plan(&plan),
+            Err(AggregationError::IncompatibleType(_))
+        ));
+    }
+
+    // --- event_matches ---
+
+    #[test]
+    fn test_event_matches_field_eq() {
+        let event = make_event(None, vec![("level", Value::String("error".into()))]);
+        assert!(event_matches(&event, &eq("level", Value::String("error".into()))));
+        assert!(!event_matches(&event, &eq("level", Value::String("info".into()))));
+    }
+
+    #[test]
+    fn test_event_matches_field_ne() {
+        let event = make_event(None, vec![("level", Value::String("error".into()))]);
+        let q = Query::FieldComparison {
+            field: "level".into(),
+            op: ComparisonOp::Ne,
+            value: Value::String("info".into()),
+        };
+        assert!(event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_field_contains() {
+        let event = make_event(
+            None,
+            vec![("message", Value::String("connection timeout".into()))],
+        );
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("timeout".into()),
+        };
+        assert!(event_matches(&event, &q));
+
+        let q = Query::FieldComparison {
+            field: "message".into(),
+            op: ComparisonOp::Contains,
+            value: Value::String("refused".into()),
+        };
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_missing_field_no_match() {
+        let event = make_event(None, vec![("level", Value::String("error".into()))]);
+        assert!(!event_matches(&event, &eq("status", Value::Number(500.0))));
+    }
+
+    #[test]
+    fn test_event_matches_and() {
+        let event = make_event(
+            None,
+            vec![
+                ("level", Value::String("error".into())),
+                ("status", Value::Number(500.0)),
+            ],
+        );
+        let both = Query::And(vec![
+            eq("level", Value::String("error".into())),
+            eq("status", Value::Number(500.0)),
+        ]);
+        assert!(event_matches(&event, &both));
+
+        let one = Query::And(vec![
+            eq("level", Value::String("error".into())),
+            eq("status", Value::Number(200.0)),
+        ]);
+        assert!(!event_matches(&event, &one));
+    }
+
+    #[test]
+    fn test_event_matches_or() {
+        let event = make_event(None, vec![("level", Value::String("warn".into()))]);
+        let q = Query::Or(vec![
+            eq("level", Value::String("error".into())),
+            eq("level", Value::String("warn".into())),
+        ]);
+        assert!(event_matches(&event, &q));
+
+        let q = Query::Or(vec![
+            eq("level", Value::String("error".into())),
+            eq("level", Value::String("info".into())),
+        ]);
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_not() {
+        let event = make_event(None, vec![("level", Value::String("info".into()))]);
+        let q = Query::Not(Box::new(eq("level", Value::String("error".into()))));
+        assert!(event_matches(&event, &q));
+
+        let q = Query::Not(Box::new(eq("level", Value::String("info".into()))));
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_all() {
+        let event = make_event(None, vec![]);
+        assert!(event_matches(&event, &Query::All()));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_in_bounds() {
+        let event = make_event(Some(ts(2024, 6, 1)), vec![]);
+        let q = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: Some(ts(2024, 12, 31)),
+        };
+        assert!(event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_bounds_inclusive() {
+        let event = make_event(Some(ts(2024, 1, 1)), vec![]);
+        let q = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: Some(ts(2024, 1, 1)),
+        };
+        assert!(event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_out_of_bounds() {
+        let event = make_event(Some(ts(2025, 6, 1)), vec![]);
+        let q = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: Some(ts(2024, 12, 31)),
+        };
+        assert!(!event_matches(&event, &q));
+    }
+
+    #[test]
+    fn test_event_matches_time_range_open_bounds() {
+        let event = make_event(Some(ts(2024, 6, 1)), vec![]);
+        let after = Query::TimeRange {
+            start: Some(ts(2024, 1, 1)),
+            end: None,
+        };
+        assert!(event_matches(&event, &after));
+
+        let before = Query::TimeRange {
+            start: None,
+            end: Some(ts(2024, 1, 1)),
+        };
+        assert!(!event_matches(&event, &before));
+    }
+
+    #[test]
+    fn test_event_matches_no_timestamp_never_matches_time_range() {
+        let event = make_event(None, vec![]);
+        let q = Query::TimeRange {
+            start: None,
+            end: None,
+        };
+        assert!(!event_matches(&event, &q));
+    }
+
+    // --- Limits ---
+
+    fn level_index() -> Index {
+        let mut idx = Index::new(None);
+        for (raw, level) in [
+            ("e1", "error"),
+            ("e2", "info"),
+            ("e3", "error"),
+            ("e4", "error"),
+            ("e5", "error"),
+        ] {
+            idx.push_event(make_event_raw(
+                raw,
+                vec![("level", Value::String(level.into()))],
+            ));
+        }
+        idx
+    }
+
+    fn result_raws<'a>(result: QueryResult<'a>) -> Vec<&'a str> {
+        match result {
+            QueryResult::Events(events) => events.iter().map(|e| e.raw.as_str()).collect(),
+            other => panic!("expected events, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_limit_head_truncates_to_first_n() {
+        let idx = level_index();
+        let plan = QueryPlan::new(
+            eq("level", Value::String("error".into())),
+            None,
+            Some(Limit::Head(2)),
+        );
+        assert_eq!(
+            result_raws(idx.apply_query_plan(&plan).unwrap()),
+            vec!["e1", "e3"]
+        );
+    }
+
+    #[test]
+    fn test_limit_tail_keeps_last_n_ascending() {
+        let idx = level_index();
+        let plan = QueryPlan::new(
+            eq("level", Value::String("error".into())),
+            None,
+            Some(Limit::Tail(2)),
+        );
+        assert_eq!(
+            result_raws(idx.apply_query_plan(&plan).unwrap()),
+            vec!["e4", "e5"]
+        );
+    }
+
+    #[test]
+    fn test_limit_larger_than_results_returns_all() {
+        let idx = level_index();
+        for limit in [Limit::Head(10), Limit::Tail(10)] {
+            let plan = QueryPlan::new(
+                eq("level", Value::String("error".into())),
+                None,
+                Some(limit),
+            );
+            assert_eq!(
+                result_raws(idx.apply_query_plan(&plan).unwrap()),
+                vec!["e1", "e3", "e4", "e5"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_limit_returns_all_matches() {
+        let idx = level_index();
+        let plan = QueryPlan::new(eq("level", Value::String("error".into())), None, None);
+        assert_eq!(
+            result_raws(idx.apply_query_plan(&plan).unwrap()),
+            vec!["e1", "e3", "e4", "e5"]
+        );
+    }
+
+    // --- Bounded memory / retention ---
+
+    fn numbered_event(i: usize) -> Event {
+        let fields = vec![("n".to_string(), Value::Number(i as f32))]
+            .into_iter()
+            .collect();
+        Event::new(
+            Some(Utc.timestamp_opt(i as i64 + 1, 0).unwrap()),
+            format!("e{i}"),
+            fields,
+        )
+    }
+
+    #[test]
+    fn test_no_eviction_at_cap_plus_slack_boundary() {
+        let max = 3;
+        let mut idx = Index::new(Some(max));
+        for i in 0..(max + SLACK) {
+            idx.push_event(numbered_event(i));
+        }
+
+        // Compaction only triggers strictly past max + SLACK, so nothing is evicted yet.
+        assert_eq!(idx.event_count(), max + SLACK);
+    }
+
+    #[test]
+    fn test_eviction_past_cap_evicts_oldest() {
+        let max = 3;
+        let total = max + SLACK + 1;
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+
+        // One push past the boundary compacts back down to exactly `max`.
+        assert_eq!(idx.event_count(), max);
+
+        // The survivors are the most recent `max` events, in order.
+        let survivors: Vec<String> = idx.events.iter().map(|e| e.raw.clone()).collect();
+        let expected: Vec<String> = ((total - max)..total).map(|i| format!("e{i}")).collect();
+        assert_eq!(survivors, expected);
+    }
+
+    #[test]
+    fn test_queries_see_only_recent_after_eviction() {
+        let max = 3;
+        let total = max + SLACK + 1;
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+
+        // An evicted event's field value is no longer queryable.
+        let evicted = Query::FieldComparison {
+            field: "n".into(),
+            op: ComparisonOp::Eq,
+            value: Value::Number(0.0),
+        };
+        assert_eq!(result_count(idx.apply_query(&evicted)), 0);
+
+        // A retained event still matches exactly once and resolves to the right event.
+        let retained = Query::FieldComparison {
+            field: "n".into(),
+            op: ComparisonOp::Eq,
+            value: Value::Number((total - 1) as f32),
+        };
+        let hits = idx.apply_query(&retained);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].raw, format!("e{}", total - 1));
+    }
+
+    #[test]
+    fn test_indexes_have_no_stale_positions_after_reindex() {
+        let max = 5;
+        // Two full compaction cycles, landing exactly on a boundary so the count is `max`.
+        let total = max + 2 * (SLACK + 1);
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+        assert_eq!(idx.event_count(), max);
+
+        // Every position in field_index points into the live events vec and back
+        // to the event that actually holds that value.
+        for value_map in idx.field_index.values() {
+            for (value, positions) in value_map {
+                for &pos in positions {
+                    assert!(pos < idx.events.len());
+                    assert_eq!(&idx.events[pos].fields["n"], value);
+                }
+            }
+        }
+
+        // Same for the time index.
+        for (timestamp, positions) in &idx.time_index {
+            for &pos in positions {
+                assert!(pos < idx.events.len());
+                assert_eq!(idx.events[pos].timestamp, Some(*timestamp));
+            }
+        }
+    }
+
+    #[test]
+    fn test_pushes_after_compaction_are_indexed_correctly() {
+        let max = 3;
+        let total = max + SLACK + 1;
+        let mut idx = Index::new(Some(max));
+        for i in 0..total {
+            idx.push_event(numbered_event(i));
+        }
+
+        // Events added after a compaction must be positioned and indexed correctly.
+        idx.push_event(numbered_event(total));
+        idx.push_event(numbered_event(total + 1));
+
+        let q = Query::FieldComparison {
+            field: "n".into(),
+            op: ComparisonOp::Eq,
+            value: Value::Number((total + 1) as f32),
+        };
+        let hits = idx.apply_query(&q);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].raw, format!("e{}", total + 1));
     }
 }

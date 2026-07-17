@@ -1,29 +1,96 @@
 use crate::event::Event;
+use crate::event::PersistedEvent;
 use crate::index::Index;
 use crate::value::Value;
+use crate::wal::Wal;
 use chrono::DateTime;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::io::SeekFrom;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use tokio::fs;
 use tokio::fs::File;
-use tokio::io;
-use tokio::io::{AsyncBufReadExt, AsyncSeekExt};
+use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt};
+use tokio::sync::broadcast;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+
+const SLEEP_TIME: u64 = 100;
+
+/// Read everything already in the file once, returning the resulting byte
+/// offset. Callers run this before opening the query socket so clients never
+/// observe a half-loaded index.
+pub async fn initial_read(
+    file_path: &PathBuf,
+    index: &Arc<RwLock<Index>>,
+    time_field: Option<&str>,
+    wal: &Option<Arc<Mutex<Wal>>>,
+    starting_byte_offset: u64,
+) -> Result<u64, io::Error> {
+    // Strict: a malformed line in the pre-existing file is reported to the
+    // user at startup instead of being silently skipped. Runs before the
+    // query socket opens, so nobody can be following yet.
+    read_file(
+        file_path,
+        index,
+        starting_byte_offset,
+        time_field,
+        wal,
+        true,
+        None,
+    )
+    .await
+}
 
 pub async fn run_tailer(
     file_path: PathBuf,
     index: Arc<RwLock<Index>>,
     time_field: Option<String>,
+    wal: Option<Arc<Mutex<Wal>>>,
+    starting_byte_offset: u64,
+    follow_tx: broadcast::Sender<Arc<Event>>,
 ) -> Result<(), io::Error> {
-    let mut byte_offset = 0;
+    let mut byte_offset = starting_byte_offset;
+
+    let mut last_inode = fs::metadata(&file_path).await.ok().map(|m| m.ino());
 
     loop {
-        byte_offset = read_file(&file_path, &index, byte_offset, time_field.as_deref()).await?;
-        sleep(Duration::from_millis(100)).await;
+        (byte_offset, last_inode) = check_rotation(&file_path, byte_offset, last_inode).await?;
+        // Lenient: a malformed line appended while the daemon is running is
+        // skipped with a warning — it must not take the whole daemon down.
+        byte_offset = read_file(
+            &file_path,
+            &index,
+            byte_offset,
+            time_field.as_deref(),
+            &wal,
+            false,
+            Some(&follow_tx),
+        )
+        .await?;
+        sleep(Duration::from_millis(SLEEP_TIME)).await;
     }
+}
+
+async fn check_rotation(
+    file_path: &PathBuf,
+    byte_offset: u64,
+    last_inode: Option<u64>,
+) -> io::Result<(u64, Option<u64>)> {
+    let Ok(metadata) = fs::metadata(file_path).await else {
+        return Ok((byte_offset, last_inode));
+    };
+
+    let new_inode = Some(metadata.ino());
+
+    if metadata.len() < byte_offset || last_inode != new_inode {
+        return Ok((0, new_inode));
+    }
+
+    Ok((byte_offset, last_inode))
 }
 
 async fn read_file(
@@ -31,26 +98,53 @@ async fn read_file(
     index: &Arc<RwLock<Index>>,
     mut byte_offset: u64,
     time_field: Option<&str>,
+    wal: &Option<Arc<Mutex<Wal>>>,
+    strict: bool,
+    follow_tx: Option<&broadcast::Sender<Arc<Event>>>,
 ) -> Result<u64, io::Error> {
-    let file = File::open(file_path).await?;
+    let Ok(file) = File::open(file_path).await else {
+        return Ok(byte_offset);
+    };
     let mut reader = io::BufReader::new(file);
 
     reader.seek(SeekFrom::Start(byte_offset)).await?;
-    let mut lines = reader.lines();
 
     let mut line_num: u64 = 0;
+    let mut buf: Vec<u8> = Vec::new();
 
-    while let Some(line) = lines.next_line().await? {
-        byte_offset += line.len() as u64 + 1; // +1 for the stripped newline
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        // A line without a trailing newline is still being written — leave it
+        // for the next poll so a torn line is never ingested or half-counted.
+        if buf.last() != Some(&b'\n') {
+            break;
+        }
+
+        byte_offset += n as u64; // exact bytes consumed, incl. '\n' (and '\r')
         line_num += 1;
 
-        let json: serde_json::Value = serde_json::from_str(&line).map_err(|e| {
-            let preview: String = line.chars().take(80).collect();
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("line {line_num} is not valid JSON: {e}\n  {preview}"),
-            )
-        })?;
+        let mut end = buf.len() - 1; // strip '\n'
+        if end > 0 && buf[end - 1] == b'\r' {
+            end -= 1; // strip '\r' from CRLF files
+        }
+        let line = String::from_utf8_lossy(&buf[..end]).into_owned();
+
+        let json: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(json) => json,
+            Err(e) => {
+                let preview: String = line.chars().take(80).collect();
+                let message = format!("line {line_num} is not valid JSON: {e}\n  {preview}");
+                if strict {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+                }
+                eprintln!("Skipping line: {message}");
+                continue;
+            }
+        };
 
         let mut timestamp: Option<DateTime<Utc>> = None;
         let mut fields: HashMap<String, Value> = HashMap::new();
@@ -67,10 +161,28 @@ async fn read_file(
             }
         }
 
-        index
-            .write()
-            .unwrap()
-            .push_event(Event::new(timestamp, line, fields));
+        let event = Event::new(timestamp, line, fields);
+
+        if let Some(tx) = follow_tx {
+            // Zero cost when nobody follows.
+            if tx.receiver_count() > 0 {
+                let _ = tx.send(Arc::new(event.clone()));
+            }
+        }
+
+        // Append to the WAL and push to the index while holding the WAL lock,
+        // so a concurrent checkpoint (which snapshots the index under the WAL
+        // lock) can never record this event's WAL state without the event.
+        match wal {
+            Some(wal) => {
+                let mut wal_guard = wal.lock().await;
+                wal_guard
+                    .append(byte_offset, PersistedEvent::from_event(&event))
+                    .await?;
+                index.write().unwrap().push_event(event);
+            }
+            None => index.write().unwrap().push_event(event),
+        }
     }
 
     Ok(byte_offset)
@@ -80,9 +192,16 @@ async fn read_file(
 mod tests {
     use super::*;
     use crate::query::{ComparisonOp, Query};
+    use tempfile::NamedTempFile;
 
     fn make_index() -> Arc<RwLock<Index>> {
-        Arc::new(RwLock::new(Index::new()))
+        Arc::new(RwLock::new(Index::new(None)))
+    }
+
+    async fn make_wal() -> Option<Arc<Mutex<Wal>>> {
+        let tmp = NamedTempFile::new().unwrap();
+        let wal = Wal::open(tmp.path(), None).await.unwrap();
+        Some(Arc::new(Mutex::new(wal)))
     }
 
     async fn read(
@@ -91,9 +210,18 @@ mod tests {
         offset: u64,
         time_field: Option<&str>,
     ) -> u64 {
-        read_file(&PathBuf::from(path), index, offset, time_field)
-            .await
-            .unwrap()
+        let wal = make_wal().await;
+        read_file(
+            &PathBuf::from(path),
+            index,
+            offset,
+            time_field,
+            &wal,
+            true,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -102,6 +230,24 @@ mod tests {
         let offset = read("test_files/empty.log", &index, 0, None).await;
         assert_eq!(offset, 0);
         assert_eq!(index.read().unwrap().event_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_no_wal_still_indexes_events() {
+        let index = make_index();
+        let offset = read_file(
+            &PathBuf::from("test_files/test.log"),
+            &index,
+            0,
+            None,
+            &None,
+            true,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(offset > 0);
+        assert_eq!(index.read().unwrap().event_count(), 25);
     }
 
     #[tokio::test]
@@ -322,22 +468,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_nonexistent_file_returns_error() {
+    async fn test_nonexistent_file_returns_unchanged_offset() {
         let index = make_index();
-        let result = read_file(
-            &PathBuf::from("test_files/does_not_exist.log"),
-            &index,
-            0,
-            None,
-        )
-        .await;
-        assert!(result.is_err());
+
+        let offset = 1;
+        let inode = Some(0);
+
+        let mut new_offset;
+        let new_inode;
+
+        new_offset = read("test_files/does_not_exist.log", &index, offset, None).await;
+        assert_eq!(offset, new_offset);
+
+        (new_offset, new_inode) = check_rotation(&PathBuf::new(), offset, inode)
+            .await
+            .unwrap();
+
+        assert_eq!(offset, new_offset);
+        assert_eq!(inode, new_inode);
+    }
+
+    #[tokio::test]
+    async fn test_check_rotation_returns_unchanged_offset_for_unchanged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+
+        let inode = Some(std::fs::metadata(&path).unwrap().ino());
+        let offset = 1;
+
+        std::fs::write(&path, "line three\nline four\n").unwrap();
+        let (new_offset, new_inode) = check_rotation(&path, offset, inode).await.unwrap();
+
+        assert_eq!(new_offset, offset);
+        assert_eq!(new_inode, inode);
+    }
+
+    #[tokio::test]
+    async fn test_truncation_resets_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "line one\nline two\n").unwrap();
+
+        let inode = Some(std::fs::metadata(&path).unwrap().ino());
+        let stale_offset = 100;
+
+        let (new_offset, new_inode) = check_rotation(&path, stale_offset, inode).await.unwrap();
+
+        assert_eq!(new_offset, 0);
+        assert_eq!(new_inode, inode);
+    }
+
+    #[tokio::test]
+    async fn test_changed_inode_updates_old_inode_and_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "new content\n").unwrap();
+
+        let inode = Some(std::fs::metadata(&path).unwrap().ino());
+        let offset = 1;
+
+        let other_path = dir.path().join("app.log.new");
+        std::fs::write(&other_path, "rotated content\n").unwrap();
+        std::fs::rename(&other_path, &path).unwrap();
+        let (new_offset, new_inode) = check_rotation(&path, offset, inode).await.unwrap();
+
+        assert_eq!(new_offset, 0);
+        assert_ne!(inode, new_inode);
     }
 
     #[tokio::test]
     async fn test_non_json_line_error_includes_line_number_and_content() {
         let index = make_index();
-        let result = read_file(&PathBuf::from("test_files/non-json.log"), &index, 0, None).await;
+        let wal = make_wal().await;
+        let result = read_file(
+            &PathBuf::from("test_files/non-json.log"),
+            &index,
+            0,
+            None,
+            &wal,
+            true,
+            None,
+        )
+        .await;
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("line 1"),
@@ -347,5 +560,69 @@ mod tests {
             err.contains("Lorem"),
             "expected line content in error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_partial_last_line_left_for_next_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        // Second line is mid-write: no trailing newline yet.
+        std::fs::write(&path, "{\"a\":1}\n{\"b\":").unwrap();
+
+        let index = make_index();
+        let wal = make_wal().await;
+        let offset = read_file(&path, &index, 0, None, &wal, true, None).await.unwrap();
+
+        // Only the complete first line is ingested; the offset stops at its end.
+        assert_eq!(index.read().unwrap().event_count(), 1);
+        assert_eq!(offset, 8);
+
+        // The writer finishes the line; the next poll picks it up whole.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "2}}").unwrap();
+
+        let offset = read_file(&path, &index, offset, None, &wal, true, None)
+            .await
+            .unwrap();
+        assert_eq!(index.read().unwrap().event_count(), 2);
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
+    }
+
+    #[tokio::test]
+    async fn test_crlf_line_endings_offsets_stay_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "{\"a\":1}\r\n{\"b\":2}\r\n").unwrap();
+
+        let index = make_index();
+        let wal = make_wal().await;
+        let offset = read_file(&path, &index, 0, None, &wal, true, None).await.unwrap();
+
+        assert_eq!(index.read().unwrap().event_count(), 2);
+        // Offset covers the full file — re-reading from it yields nothing new.
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
+        let offset2 = read_file(&path, &index, offset, None, &wal, true, None)
+            .await
+            .unwrap();
+        assert_eq!(offset2, offset);
+        assert_eq!(index.read().unwrap().event_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_lenient_mode_skips_malformed_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, "{\"a\":1}\nnot json at all\n{\"b\":2}\n").unwrap();
+
+        let index = make_index();
+        let wal = make_wal().await;
+        let offset = read_file(&path, &index, 0, None, &wal, false, None)
+            .await
+            .unwrap();
+
+        // The malformed line is skipped, the valid lines around it survive.
+        assert_eq!(index.read().unwrap().event_count(), 2);
+        assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
     }
 }

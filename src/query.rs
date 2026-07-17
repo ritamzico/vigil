@@ -12,6 +12,7 @@ pub enum ComparisonOp {
     Le,
     Gt,
     Ge,
+    Contains,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -27,6 +28,7 @@ pub enum Query {
     },
     And(Vec<Query>),
     Or(Vec<Query>),
+    Not(Box<Query>),
     All(),
 }
 
@@ -35,13 +37,19 @@ pub enum QueryResult<'a> {
     Events(Vec<&'a Event>),
     Count(usize),
     CountBy(usize),
-    Average(f32),
-    Percentage(f32),
+    Scalar(f32),
 }
 
 pub struct QueryPlan {
-    query: Query,
-    aggregation: Option<Aggregation>,
+    pub query: Query,
+    pub aggregation: Option<Aggregation>,
+    pub limit: Option<Limit>,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum Limit {
+    Head(usize),
+    Tail(usize),
 }
 
 pub enum Aggregation {
@@ -49,6 +57,9 @@ pub enum Aggregation {
     CountBy(String),
     Average(String),
     Percentage(String, f32),
+    Sum(String),
+    Min(String),
+    Max(String),
 }
 
 impl fmt::Display for QueryResult<'_> {
@@ -57,28 +68,27 @@ impl fmt::Display for QueryResult<'_> {
             QueryResult::Events(events) => {
                 let s = events
                     .iter()
-                    .map(|e| e.get_raw().as_str())
+                    .map(|e| e.raw.as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
                 write!(f, "{}", s)
             }
             QueryResult::Count(count) | QueryResult::CountBy(count) => write!(f, "{}", count),
-            QueryResult::Average(avg) => write!(f, "{}", avg),
-            QueryResult::Percentage(p) => write!(f, "{}", p),
+            QueryResult::Scalar(n) => write!(f, "{}", n),
         }
     }
 }
 
 impl QueryPlan {
-    pub fn new(query: Query, aggregation: Option<Aggregation>) -> QueryPlan {
-        QueryPlan { query, aggregation }
-    }
-
-    pub fn get_query(&self) -> &Query {
-        return &self.query;
-    }
-
-    pub fn get_aggregation(&self) -> &Option<Aggregation> {
-        return &self.aggregation;
+    pub fn new(
+        query: Query,
+        aggregation: Option<Aggregation>,
+        limit: Option<Limit>,
+    ) -> QueryPlan {
+        QueryPlan {
+            query,
+            aggregation,
+            limit,
+        }
     }
 }

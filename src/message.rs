@@ -12,6 +12,7 @@ pub enum MessageKind {
     ShutdownAck,
     Watch,
     WatchAck,
+    Follow,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -22,20 +23,12 @@ pub struct WatchPayload {
 
 #[derive(Serialize, Deserialize)]
 pub struct Message {
-    message_kind: MessageKind,
-    data: String,
+    pub message_kind: MessageKind,
+    pub data: String,
 }
 
 impl Message {
     pub fn new(message_kind: MessageKind, data: String) -> Message {
         Message { message_kind, data }
-    }
-
-    pub fn get_message_kind(&self) -> &MessageKind {
-        &self.message_kind
-    }
-
-    pub fn get_message_data(&self) -> &String {
-        &self.data
     }
 }

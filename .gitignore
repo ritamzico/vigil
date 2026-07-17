@@ -1,1 +1,10 @@
 /target
+/plans
+
+/bench/bin
+/bench/logs
+/bench/data
+
+.claude/
+.claude
+.claude

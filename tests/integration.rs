@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
+use tempfile::TempDir;
 
 const BINARY: &str = env!("CARGO_BIN_EXE_vigil");
 const SOCKET: &str = "/tmp/vigil.sock";
@@ -12,6 +13,10 @@ static LOCK: Mutex<()> = Mutex::new(());
 
 struct Daemon {
     log_file: PathBuf,
+    // Held for its Drop side effect (directory cleanup); each test gets its
+    // own isolated --data-dir so daemon restarts across tests never recover
+    // a previous test's persisted state.
+    _data_dir: TempDir,
 }
 
 impl Daemon {
@@ -30,11 +35,19 @@ impl Daemon {
             writeln!(f, "{}", event).unwrap();
         }
 
+        let data_dir = TempDir::new().unwrap();
+
         let mut cmd = Command::new(BINARY);
-        cmd.arg("--watch").arg(&log_path);
+        cmd.arg("--watch")
+            .arg(&log_path)
+            .arg("--data-dir")
+            .arg(data_dir.path());
         if let Some(tf) = time_field {
             cmd.arg("--time-field").arg(tf);
         }
+        // The daemon intentionally outlives this call; it is stopped via
+        // --stop in Drop and reaped when the short-lived test binary exits.
+        #[allow(clippy::zombie_processes)]
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -43,7 +56,10 @@ impl Daemon {
 
         for _ in 0..50 {
             if Path::new(SOCKET).exists() {
-                return Daemon { log_file: log_path };
+                return Daemon {
+                    log_file: log_path,
+                    _data_dir: data_dir,
+                };
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -140,6 +156,41 @@ fn test_or_query() {
     assert_eq!(stdout(&out).lines().count(), 2);
 }
 
+#[test]
+fn test_not_and_paren_query() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"level":"ERROR","status":500}"#,
+        r#"{"level":"WARN","status":503}"#,
+        r#"{"level":"ERROR","status":200}"#,
+        r#"{"level":"INFO","status":500}"#,
+    ]);
+
+    let out = daemon.query("(level = ERROR OR level = WARN) AND status >= 500");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out).lines().count(), 2);
+
+    let out = daemon.query("NOT status = 500 | count");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "2");
+}
+
+#[test]
+fn test_contains_query() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"message":"connection timeout after 30s"}"#,
+        r#"{"message":"request ok"}"#,
+    ]);
+
+    let out = daemon.query("message ~ timeout");
+
+    assert!(out.status.success());
+    let body = stdout(&out);
+    assert_eq!(body.lines().count(), 1);
+    assert!(body.contains("timeout"));
+}
+
 // --- Aggregations ---
 
 #[test]
@@ -186,6 +237,28 @@ fn test_avg_aggregation() {
     assert_eq!(stdout(&out), "200");
 }
 
+#[test]
+fn test_sum_min_max_aggregations() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[
+        r#"{"status":500,"latency":100}"#,
+        r#"{"status":500,"latency":300}"#,
+        r#"{"status":200,"latency":900}"#,
+    ]);
+
+    let out = daemon.query("status = 500 | sum latency");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "400");
+
+    let out = daemon.query("status = 500 | min latency");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "100");
+
+    let out = daemon.query("status = 500 | max latency");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "300");
+}
+
 // --- Time range ---
 
 #[test]
@@ -206,13 +279,30 @@ fn test_time_range_query() {
 }
 
 #[test]
+fn test_relative_time_range_query() {
+    let _lock = LOCK.lock().unwrap();
+    let now = chrono::Utc::now();
+    let recent = (now - chrono::Duration::minutes(5)).to_rfc3339();
+    let old = (now - chrono::Duration::hours(2)).to_rfc3339();
+    let daemon = Daemon::start_with_time_field(
+        &[
+            &format!(r#"{{"ts":"{}","level":"ERROR"}}"#, old),
+            &format!(r#"{{"ts":"{}","level":"ERROR"}}"#, recent),
+        ],
+        Some("ts"),
+    );
+
+    let out = daemon.query("ts > -1h | count");
+    assert!(out.status.success());
+    assert_eq!(stdout(&out), "1");
+}
+
+#[test]
 fn test_time_range_requires_time_field_flag() {
     let _lock = LOCK.lock().unwrap();
     // Daemon started without --time-field: "ts" is just a regular string field,
     // so the time range query returns no results.
-    let daemon = Daemon::start(&[
-        r#"{"ts":"2026-01-01T00:00:00Z","level":"ERROR"}"#,
-    ]);
+    let daemon = Daemon::start(&[r#"{"ts":"2026-01-01T00:00:00Z","level":"ERROR"}"#]);
 
     let out = daemon.query("ts > 2026-03-01T00:00:00Z | count");
     assert!(out.status.success());
@@ -233,6 +323,38 @@ fn test_new_events_are_picked_up() {
     let out = daemon.query("level = ERROR");
     assert!(out.status.success());
     assert!(stdout(&out).contains(r#""id":42"#));
+}
+
+// --- Robustness ---
+
+#[test]
+fn test_malformed_line_while_tailing_does_not_kill_daemon() {
+    let _lock = LOCK.lock().unwrap();
+    let daemon = Daemon::start(&[r#"{"level":"INFO"}"#]);
+
+    // A plain-text line (e.g. a stack trace) lands in the log mid-tail.
+    daemon.append("not json: something panicked here");
+    daemon.append(r#"{"level":"ERROR","id":7}"#);
+
+    // The daemon skipped the bad line and kept ingesting.
+    let out = daemon.query("level = ERROR");
+    assert!(out.status.success(), "daemon died after malformed line");
+    assert!(stdout(&out).contains(r#""id":7"#));
+}
+
+#[test]
+fn test_socket_permissions_restricted_to_owner() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = LOCK.lock().unwrap();
+    let _daemon = Daemon::start(&[]);
+
+    let mode = std::fs::metadata(SOCKET).unwrap().permissions().mode();
+    assert_eq!(
+        mode & 0o777,
+        0o600,
+        "socket must not be accessible to other users"
+    );
 }
 
 // --- Errors ---
@@ -267,13 +389,19 @@ fn test_stop_shuts_down_daemon_and_removes_socket() {
 
     let log_path = std::env::temp_dir().join("vigil_integration_test.log");
     std::fs::File::create(&log_path).unwrap();
+    let data_dir = TempDir::new().unwrap();
 
     let _ = Command::new(BINARY).arg("--stop").output();
     std::thread::sleep(Duration::from_millis(100));
 
+    // The daemon intentionally outlives this call; it is stopped via --stop
+    // below and reaped when the short-lived test binary exits.
+    #[allow(clippy::zombie_processes)]
     Command::new(BINARY)
         .arg("--watch")
         .arg(&log_path)
+        .arg("--data-dir")
+        .arg(data_dir.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -293,7 +421,10 @@ fn test_stop_shuts_down_daemon_and_removes_socket() {
     assert_eq!(stdout(&out), "Daemon stopped.");
 
     std::thread::sleep(Duration::from_millis(200));
-    assert!(!Path::new(SOCKET).exists(), "Socket file should be removed after stop");
+    assert!(
+        !Path::new(SOCKET).exists(),
+        "Socket file should be removed after stop"
+    );
 
     std::fs::remove_file(&log_path).ok();
 }
