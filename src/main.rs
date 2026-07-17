@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use crate::index::Index;
 use crate::recover::data_dir;
 use crate::recover::recover;
-use crate::wal::WAL;
+use crate::wal::Wal;
 
 mod checkpoint;
 mod event;
@@ -91,6 +91,9 @@ async fn main() {
     }
 }
 
+// One parameter per CLI flag; a params struct for this single call site
+// would add ceremony without improving clarity.
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon(
     path: PathBuf,
     detach: bool,
@@ -134,6 +137,9 @@ async fn run_daemon(
         if let Some(max_events) = max_events {
             cmd.arg("--max-events").arg(max_events.to_string());
         }
+        // Intentional daemonization: the parent exits right after spawning,
+        // so the child is reparented to init and never left a zombie.
+        #[allow(clippy::zombie_processes)]
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -158,7 +164,7 @@ async fn run_daemon(
     .await;
 
     let index = Arc::new(RwLock::new(index_inner));
-    let mut wal: Option<Arc<Mutex<WAL>>> = wal_inner.map(|w| Arc::new(Mutex::new(w)));
+    let mut wal: Option<Arc<Mutex<Wal>>> = wal_inner.map(|w| Arc::new(Mutex::new(w)));
 
     // Ingest the file's existing contents before accepting queries, so a client
     // that connects the instant the socket appears never sees a partial index.
@@ -317,7 +323,7 @@ async fn resolve_state(
     data_dir_override: Option<PathBuf>,
     no_persist: bool,
     max_events: Option<usize>,
-) -> (Index, Option<WAL>, u64, Option<PathBuf>) {
+) -> (Index, Option<Wal>, u64, Option<PathBuf>) {
     if no_persist {
         return (Index::new(max_events), None, 0, None);
     }
@@ -350,7 +356,7 @@ async fn resolve_state(
 }
 
 fn spawn_flush_task(
-    wal: &Option<Arc<Mutex<WAL>>>,
+    wal: &Option<Arc<Mutex<Wal>>>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<io::Result<()>> {
     match wal {
@@ -362,7 +368,7 @@ fn spawn_flush_task(
 fn spawn_checkpoint_task(
     dir: &Option<PathBuf>,
     index: &Arc<RwLock<Index>>,
-    wal: &Option<Arc<Mutex<WAL>>>,
+    wal: &Option<Arc<Mutex<Wal>>>,
     time_field: &Option<String>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<io::Result<()>> {
@@ -391,7 +397,7 @@ async fn send_watch(path: PathBuf, time_field: Option<String>) -> Result<(), io:
         from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     match response.message_kind {
         MessageKind::WatchAck => Ok(()),
-        _ => Err(io::Error::new(io::ErrorKind::Other, "unexpected response")),
+        _ => Err(io::Error::other("unexpected response")),
     }
 }
 

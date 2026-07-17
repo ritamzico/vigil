@@ -4,19 +4,19 @@ use tokio::io;
 
 use crate::index::Index;
 use crate::snapshot::Snapshot;
-use crate::wal::{WALRecord, WAL};
+use crate::wal::{WALRecord, Wal};
 
 const DATA_DIR_SUFFIX: &str = ".local/share/vigil";
 const WAL_FILE_NAME: &str = "wal.log";
 
 pub struct Recovered {
     pub index: Index,
-    pub wal: WAL,
+    pub wal: Wal,
     pub byte_offset: u64,
 }
 
 impl Recovered {
-    pub fn new(index: Index, wal: WAL, byte_offset: u64) -> Recovered {
+    pub fn new(index: Index, wal: Wal, byte_offset: u64) -> Recovered {
         Recovered {
             index,
             wal,
@@ -39,7 +39,7 @@ pub async fn recover(dir: &Path, max_events: Option<usize>) -> io::Result<Recove
         }
     };
 
-    let mut wal = WAL::open(&dir.join(WAL_FILE_NAME), None).await?;
+    let mut wal = Wal::open(&dir.join(WAL_FILE_NAME), None).await?;
     let records = wal.replay().await?;
 
     let records: Vec<WALRecord> = records.into_iter().filter(|r| r.seq >= next_seq).collect();
@@ -92,7 +92,7 @@ mod tests {
     }
 
     async fn write_wal_records(dir: &Path, start_seq: u64, raws: &[&str]) {
-        let mut wal = WAL::open(&dir.join(WAL_FILE_NAME), Some(start_seq))
+        let mut wal = Wal::open(&dir.join(WAL_FILE_NAME), Some(start_seq))
             .await
             .unwrap();
         for (i, raw) in raws.iter().enumerate() {
@@ -131,8 +131,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let snapshot = Snapshot::new(None, 50, 5, vec![make_event("from-snapshot")]);
         snapshot.save(dir.path()).await.unwrap();
-        // touch an empty wal.log so WAL::open succeeds
-        WAL::open(&dir.path().join(WAL_FILE_NAME), None)
+        // touch an empty wal.log so Wal::open succeeds
+        Wal::open(&dir.path().join(WAL_FILE_NAME), None)
             .await
             .unwrap();
 

@@ -45,6 +45,9 @@ impl Daemon {
         if let Some(tf) = time_field {
             cmd.arg("--time-field").arg(tf);
         }
+        // The daemon intentionally outlives this call; it is stopped via
+        // --stop in Drop and reaped when the short-lived test binary exits.
+        #[allow(clippy::zombie_processes)]
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -172,6 +175,7 @@ fn test_not_and_paren_query() {
     assert_eq!(stdout(&out), "2");
 }
 
+#[test]
 fn test_contains_query() {
     let _lock = LOCK.lock().unwrap();
     let daemon = Daemon::start(&[
@@ -390,6 +394,9 @@ fn test_stop_shuts_down_daemon_and_removes_socket() {
     let _ = Command::new(BINARY).arg("--stop").output();
     std::thread::sleep(Duration::from_millis(100));
 
+    // The daemon intentionally outlives this call; it is stopped via --stop
+    // below and reaped when the short-lived test binary exits.
+    #[allow(clippy::zombie_processes)]
     Command::new(BINARY)
         .arg("--watch")
         .arg(&log_path)

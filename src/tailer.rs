@@ -2,7 +2,7 @@ use crate::event::Event;
 use crate::event::PersistedEvent;
 use crate::index::Index;
 use crate::value::Value;
-use crate::wal::WAL;
+use crate::wal::Wal;
 use chrono::DateTime;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ pub async fn initial_read(
     file_path: &PathBuf,
     index: &Arc<RwLock<Index>>,
     time_field: Option<&str>,
-    wal: &Option<Arc<Mutex<WAL>>>,
+    wal: &Option<Arc<Mutex<Wal>>>,
     starting_byte_offset: u64,
 ) -> Result<u64, io::Error> {
     // Strict: a malformed line in the pre-existing file is reported to the
@@ -38,7 +38,7 @@ pub async fn run_tailer(
     file_path: PathBuf,
     index: Arc<RwLock<Index>>,
     time_field: Option<String>,
-    wal: Option<Arc<Mutex<WAL>>>,
+    wal: Option<Arc<Mutex<Wal>>>,
     starting_byte_offset: u64,
 ) -> Result<(), io::Error> {
     let mut byte_offset = starting_byte_offset;
@@ -85,7 +85,7 @@ async fn read_file(
     index: &Arc<RwLock<Index>>,
     mut byte_offset: u64,
     time_field: Option<&str>,
-    wal: &Option<Arc<Mutex<WAL>>>,
+    wal: &Option<Arc<Mutex<Wal>>>,
     strict: bool,
 ) -> Result<u64, io::Error> {
     let Ok(file) = File::open(file_path).await else {
@@ -177,9 +177,9 @@ mod tests {
         Arc::new(RwLock::new(Index::new(None)))
     }
 
-    async fn make_wal() -> Option<Arc<Mutex<WAL>>> {
+    async fn make_wal() -> Option<Arc<Mutex<Wal>>> {
         let tmp = NamedTempFile::new().unwrap();
-        let wal = WAL::open(tmp.path(), None).await.unwrap();
+        let wal = Wal::open(tmp.path(), None).await.unwrap();
         Some(Arc::new(Mutex::new(wal)))
     }
 
@@ -549,7 +549,7 @@ mod tests {
         // The writer finishes the line; the next poll picks it up whole.
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        write!(f, "2}}\n").unwrap();
+        writeln!(f, "2}}").unwrap();
 
         let offset = read_file(&path, &index, offset, None, &wal, true)
             .await

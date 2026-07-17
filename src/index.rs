@@ -99,7 +99,7 @@ impl Index {
 
                 let mut values = numeric_values(&events, field)?;
 
-                values.sort_by(|a, b| a.total_cmp(b));
+                values.sort_by(f32::total_cmp);
                 let i = (*p * values.len() as f32).ceil() as usize - 1;
 
                 Ok(QueryResult::Scalar(values[i]))

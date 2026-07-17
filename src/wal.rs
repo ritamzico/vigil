@@ -36,14 +36,14 @@ impl WALRecord {
     }
 }
 
-pub struct WAL {
+pub struct Wal {
     reader: BufReader<File>,
     writer: BufWriter<File>,
     pub next_seq: u64,
     pub last_byte_offset: u64,
 }
 
-impl WAL {
+impl Wal {
     pub async fn open(path: &Path, starting_seq: Option<u64>) -> io::Result<Self> {
         let writer_file = OpenOptions::new()
             .create(true)
@@ -51,7 +51,7 @@ impl WAL {
             .open(path)
             .await?;
         let reader_file = File::open(path).await?;
-        Ok(WAL {
+        Ok(Wal {
             reader: BufReader::new(reader_file),
             writer: BufWriter::new(writer_file),
             next_seq: starting_seq.unwrap_or(0),
@@ -177,9 +177,9 @@ mod tests {
         PersistedEvent::new(None, raw.to_string(), HashMap::new())
     }
 
-    async fn open_temp_wal() -> (WAL, NamedTempFile) {
+    async fn open_temp_wal() -> (Wal, NamedTempFile) {
         let tmp = NamedTempFile::new().unwrap();
-        let wal = WAL::open(tmp.path(), None).await.unwrap();
+        let wal = Wal::open(tmp.path(), None).await.unwrap();
         (wal, tmp)
     }
 
@@ -239,7 +239,7 @@ mod tests {
     async fn test_crc_corruption_drops_corrupt_record_and_truncates() {
         let tmp = NamedTempFile::new().unwrap();
         {
-            let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+            let mut wal = Wal::open(tmp.path(), None).await.unwrap();
             wal.append(0, make_event("data")).await.unwrap();
             wal.flush_fsync().await.unwrap();
         }
@@ -250,7 +250,7 @@ mod tests {
         bytes[mid] ^= 0xFF;
         tokio::fs::write(tmp.path(), &bytes).await.unwrap();
 
-        let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+        let mut wal = Wal::open(tmp.path(), None).await.unwrap();
         let records = wal.replay().await.unwrap();
         assert!(records.is_empty());
 
@@ -263,7 +263,7 @@ mod tests {
     async fn test_torn_tail_keeps_intact_prefix() {
         let tmp = NamedTempFile::new().unwrap();
         {
-            let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+            let mut wal = Wal::open(tmp.path(), None).await.unwrap();
             wal.append(0, make_event("good-0")).await.unwrap();
             wal.append(10, make_event("good-1")).await.unwrap();
             wal.flush_fsync().await.unwrap();
@@ -277,7 +277,7 @@ mod tests {
         bytes.extend_from_slice(b"partial");
         tokio::fs::write(tmp.path(), &bytes).await.unwrap();
 
-        let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+        let mut wal = Wal::open(tmp.path(), None).await.unwrap();
         let records = wal.replay().await.unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].event, make_event("good-0"));
@@ -292,7 +292,7 @@ mod tests {
     async fn test_appends_after_torn_tail_recovery_survive_next_replay() {
         let tmp = NamedTempFile::new().unwrap();
         {
-            let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+            let mut wal = Wal::open(tmp.path(), None).await.unwrap();
             wal.append(0, make_event("good")).await.unwrap();
             wal.flush_fsync().await.unwrap();
         }
@@ -304,7 +304,7 @@ mod tests {
         tokio::fs::write(tmp.path(), &bytes).await.unwrap();
 
         // First recovery drops the torn tail, then the daemon keeps appending.
-        let mut wal = WAL::open(tmp.path(), Some(1)).await.unwrap();
+        let mut wal = Wal::open(tmp.path(), Some(1)).await.unwrap();
         let records = wal.replay().await.unwrap();
         assert_eq!(records.len(), 1);
         wal.append(20, make_event("after-recovery")).await.unwrap();
@@ -312,7 +312,7 @@ mod tests {
 
         // A later recovery must see both records — nothing written after the
         // truncation may be lost.
-        let mut wal = WAL::open(tmp.path(), None).await.unwrap();
+        let mut wal = Wal::open(tmp.path(), None).await.unwrap();
         let records = wal.replay().await.unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[1].event, make_event("after-recovery"));
@@ -335,7 +335,7 @@ mod tests {
     #[tokio::test]
     async fn test_open_with_starting_seq_resumes_numbering() {
         let tmp = NamedTempFile::new().unwrap();
-        let mut wal = WAL::open(tmp.path(), Some(10)).await.unwrap();
+        let mut wal = Wal::open(tmp.path(), Some(10)).await.unwrap();
 
         wal.append(0, make_event("resumed")).await.unwrap();
         wal.flush_fsync().await.unwrap();

@@ -52,7 +52,7 @@ pub fn parse_query(query_string: &str, time_field: Option<&str>) -> Result<Query
     let tokens: Vec<&str> = owned_tokens.iter().map(String::as_str).collect();
 
     if *tokens
-        .get(0)
+        .first()
         .ok_or_else(|| IncorrectFormat(String::from("empty query")))?
         == "|"
     {
@@ -124,16 +124,16 @@ fn parse_aggregation(tokens: &[&str], pos: usize) -> Result<Option<Aggregation>,
                     .ok_or_else(|| IncorrectFormat(String::from("no field to count by")))?;
                 Ok(Some(Aggregation::CountBy(field.to_string())))
             }
-            Some(_) => Err(unexpected_token(&tokens, pos + 1)),
+            Some(_) => Err(unexpected_token(tokens, pos + 1)),
             None => Ok(Some(Aggregation::Count)),
         },
         "avg" => {
-            let field = *&tokens
+            let field = tokens
                 .get(pos + 1)
                 .ok_or_else(|| IncorrectFormat(String::from("'avg' requires a field name, e.g.: avg latency_ms")))?;
 
             if tokens.get(pos + 2).is_some() {
-                return Err(unexpected_token(&tokens, pos + 2));
+                return Err(unexpected_token(tokens, pos + 2));
             }
 
             Ok(Some(Aggregation::Average(field.to_string())))
@@ -171,7 +171,7 @@ fn parse_aggregation(tokens: &[&str], pos: usize) -> Result<Option<Aggregation>,
                     })?
                     .to_string();
                 if tokens.get(pos + 2).is_some() {
-                    return Err(unexpected_token(&tokens, pos + 2));
+                    return Err(unexpected_token(tokens, pos + 2));
                 }
                 return Ok(Some(Aggregation::Percentage(field, n as f32 / 100.0)));
             }

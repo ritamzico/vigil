@@ -54,10 +54,7 @@ impl PersistedEvent {
     }
 
     pub fn from_event(event: &Event) -> PersistedEvent {
-        let timestamp = match event.timestamp {
-            Some(timestamp) => Some(timestamp.timestamp_millis()),
-            None => None,
-        };
+        let timestamp = event.timestamp.map(|timestamp| timestamp.timestamp_millis());
 
         Self::new(timestamp, event.raw.clone(), event.fields.clone())
     }
