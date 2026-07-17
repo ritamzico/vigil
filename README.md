@@ -13,7 +13,7 @@ vigil -f "level = ERROR"
 
 `vigil --watch` starts a daemon that tails the file and indexes every JSON log line into memory. It maintains a field index (for fast equality and comparison queries) and a time index (for time range queries). Queries are sent to the daemon over a Unix socket and return immediately from the index.
 
-To survive restarts, the daemon persists its progress with a **write-ahead log (WAL)** and periodic **snapshots** (see [Persistence & crash recovery](#persistence--crash-recovery)). On restart it reloads the last snapshot and replays the WAL instead of re-reading the whole file from the beginning.
+To survive restarts, the daemon persists its progress with a write-ahead log (WAL) and periodic snapshots. On restart it reloads the last snapshot and replays the WAL instead of re-reading the whole file from the beginning. See [Architecture](docs/architecture.md) for the full design.
 
 ## Installation
 
@@ -21,270 +21,45 @@ To survive restarts, the daemon persists its progress with a **write-ahead log (
 cargo install --path .
 ```
 
-## Usage
+## Quick start
 
-### Start the daemon
+Each log line must be a flat JSON object:
 
-```
-vigil --watch <file> [--time-field <field>] [-d]
-```
-
-| Flag | Description |
-|------|-------------|
-| `--watch <file>` | Path to the JSON log file to tail |
-| `--time-field <field>` | JSON field containing RFC 3339 timestamps (enables time range queries) |
-| `-d`, `--detach` | Run the daemon in the background |
-
-The daemon watches the file for new lines as they are appended. It must be running before queries can be issued.
-
-**Examples:**
-
-```sh
-# Foreground (useful for debugging)
-vigil --watch /var/log/app.log
-
-# With time indexing
-vigil --watch /var/log/app.log --time-field timestamp
-
-# Detached background daemon
-vigil --watch /var/log/app.log --time-field timestamp -d
-```
-
-### Query
-
-```
-vigil "<query>"
-```
-
-Queries are sent to the running daemon. Results are printed to stdout, one raw log line per result (or a single number for aggregations).
-
-### Follow (live queries)
-
-```
-vigil -f "<query>"
-```
-
-A `tail -f | grep` workflow: the daemon streams each newly ingested event that matches the filter to your terminal as a raw log line, as it is appended to the watched file. The stream continues until you interrupt it (Ctrl-C) or the daemon stops.
-
-Follow supports **filters only** — no `|` aggregation stages. `vigil -f "level = ERROR | count"` is rejected.
-
-```sh
-# Stream new errors as they arrive
-vigil -f "level = ERROR"
-
-# Combine filters as usual
-vigil -f "status >= 500 AND method = POST"
-```
-
-Follow only sees events ingested after it starts; use a normal query for history.
-
-### Stop the daemon
-
-```
-vigil --stop
-```
-
----
-
-## Persistence & crash recovery
-
-By default the daemon persists its index so a restart doesn't have to re-read and re-parse the entire log file. Two mechanisms work together:
-
-- **Write-ahead log (WAL).** Every indexed line is appended to `wal.log` and periodically fsync'd, so recently ingested events survive a crash.
-- **Snapshots.** Periodically (and on a graceful `--stop`) the full in-memory index is written to `snapshot.bin`, and the WAL is truncated.
-
-On startup the daemon loads the latest snapshot, replays any WAL records newer than the snapshot, and resumes tailing from where it left off — far faster than a cold re-scan for large files.
-
-Persisted state lives in a per-file data directory: `$HOME/.local/share/vigil/<hash>/` by default, where `<hash>` is derived from the watched file's absolute path (so each watched file gets its own snapshot/WAL).
-
-### Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--data-dir <path>` | `$HOME/.local/share/vigil` | Base directory for snapshots and the WAL |
-| `--fsync-interval-ms <ms>` | `500` | How often the WAL is flushed and fsync'd to disk |
-| `--checkpoint-interval-secs <secs>` | `60` | How often a full snapshot is written and the WAL truncated |
-| `--no-persist` | off | Disable persistence entirely (pure in-memory; restart re-reads the file) |
-| `--max-events <n>` | `2000000` | Retain only the most recent events, evicting the oldest to keep memory bounded |
-
-**Trade-offs.** A shorter `--fsync-interval-ms` narrows the window of events that could be lost on a hard crash, at the cost of more frequent disk I/O. A shorter `--checkpoint-interval-secs` keeps the WAL small and speeds crash recovery, at the cost of more frequent snapshot writes. With `--max-events <n>`, queries only ever see the most recent `n` events — older events are dropped once the cap is exceeded. Eviction is amortized, so the index may transiently hold up to ~1024 events beyond `n` before compacting back down.
-
-**Examples:**
-
-```sh
-# Default persistence (snapshots every 60s, WAL fsync every 500ms)
-vigil --watch /var/log/app.log --time-field timestamp
-
-# Durable: fsync every 100ms, snapshot every 10s
-vigil --watch /var/log/app.log --fsync-interval-ms 100 --checkpoint-interval-secs 10
-
-# Custom data directory
-vigil --watch /var/log/app.log --data-dir /mnt/fast-ssd/vigil
-
-# Opt out of persistence
-vigil --watch /var/log/app.log --no-persist
-
-# Cap memory: keep only the most recent 1M events
-vigil --watch /var/log/app.log --max-events 1000000
-```
-
----
-
-## Query language
-
-A query is a filter expression, optionally followed by a pipeline stage using `|`. The stage is either an aggregation or a result limit — one or the other, not both.
-
-```
-<filter> | <aggregation>
-<filter> | limit <N>
-<filter> | tail <N>
-```
-
-Without an aggregation, results are raw log lines in chronological (ingestion) order.
-
-### Filters
-
-#### Field comparison
-
-```
-<field> <op> <value>
-```
-
-| Operator | Meaning |
-|----------|---------|
-| `=` | equal |
-| `!=` | not equal |
-| `<` | less than |
-| `<=` | less than or equal |
-| `>` | greater than |
-| `>=` | greater than or equal |
-| `~` | contains substring (string fields only) |
-
-Values are automatically typed: `500` is a number, `true`/`false` are booleans, anything else is a string. The `~` search term is always treated as a string, and it only matches string fields.
-
-```
-status = 500
-level = ERROR
-latency_ms > 1000
-active != true
-message ~ timeout
-```
-
-`~` matches a literal substring only — the search term can't contain spaces (queries are tokenized on whitespace), and there is no regex support. A regex operator (`=~`, backed by the `regex` crate) is a possible future extension.
-
-#### Boolean logic
-
-Use `AND`, `OR`, and `NOT` to combine filters, and parentheses to group. `NOT` binds tighter than `AND`, which binds tighter than `OR`.
-
-```
-status = 500 AND level = ERROR
-status = 500 OR status = 503
-level = ERROR AND method = POST OR level = WARN AND status >= 400
-NOT status = 500
-status = 500 AND NOT level = INFO
-(level = ERROR OR level = WARN) AND status >= 500
-```
-
-`NOT` matches every event the inner filter does not — including events that lack the field entirely.
-
-#### Time range
-
-Requires `--time-field <field>` when starting the daemon. The field's value must be an RFC 3339 timestamp (e.g. `2026-01-15T00:00:00Z`).
-
-```
-<time-field> > <timestamp>    # events after this time
-<time-field> < <timestamp>    # events before this time
-```
-
-`<timestamp>` is one of:
-
-| Form | Meaning |
-|------|---------|
-| RFC 3339 | absolute time, e.g. `2026-01-15T00:00:00Z` |
-| `now` | the current time |
-| `-<N><s\|m\|h\|d>` | `N` seconds/minutes/hours/days ago, e.g. `-1h` |
-
-Relative values resolve when the query runs, so `timestamp > -1h` always means the last hour.
-
-```
-timestamp > -1h                 # events from the last hour
-timestamp > -30m | count        # count of events from the last 30 minutes
-```
-
-Combine with `AND` for a range:
-
-```
-timestamp > 2026-01-15T00:00:00Z AND timestamp < 2026-01-15T06:00:00Z
-timestamp > -1d AND timestamp < -12h
-```
-
-#### Match all
-
-Start with `|` to skip filtering and aggregate over all events:
-
-```
-| count
-```
-
-### Aggregations
-
-Append `| <aggregation>` to a filter to compute a result instead of returning raw events.
-
-| Aggregation | Output |
-|-------------|--------|
-| `count` | Number of matching events |
-| `count by <field>` | Number of matching events that have `<field>` |
-| `avg <field>` | Average of `<field>` across matching events |
-| `sum <field>` | Sum of `<field>` across matching events |
-| `min <field>` | Minimum of `<field>` across matching events |
-| `max <field>` | Maximum of `<field>` across matching events |
-| `p<N> <field>` | Nth percentile of `<field>` (N is 1–100) |
-
-```
-level = ERROR | count
-level = ERROR | count by request_id
-status >= 500 | avg latency_ms
-status >= 500 | sum latency_ms
-status >= 500 | min latency_ms
-status >= 500 | max latency_ms
-status >= 500 | p99 latency_ms
-status >= 500 | p50 latency_ms
-| count
-```
-
-### Result limiting
-
-Append `| limit N` or `| tail N` to a filter to cap how many raw events are returned. Results are in chronological (ingestion) order: `limit N` keeps the first N matches, `tail N` keeps the last N matches (still oldest-first). A limit occupies the same pipeline slot as an aggregation, so a query can have one or the other, not both.
-
-```
-level = ERROR | limit 20        # first 20 matching events
-level = ERROR | tail 5          # last 5 matching events
-| tail 10                       # last 10 events overall
-```
-
----
-
-## Supported log format
-
-Each line must be a flat JSON object. Scalar field types are indexed:
-
-| JSON type | Supported |
-|-----------|-----------|
-| string | yes |
-| number | yes |
-| boolean | yes |
-| array | no (ignored) |
-| object | no (ignored) |
-
-**Example log line:**
 ```json
 {"timestamp": "2026-01-15T12:00:00Z", "level": "ERROR", "status": 500, "latency_ms": 243, "method": "POST", "path": "/api/orders"}
 ```
 
----
+Start the daemon, query, and stop:
+
+```sh
+# Start a background daemon tailing the file, with time indexing
+vigil --watch /var/log/app.log --time-field timestamp -d
+
+# Filter: raw matching lines, oldest first
+vigil "level = ERROR AND status >= 500"
+
+# Aggregate
+vigil "status >= 500 | count"
+vigil "level = ERROR | p99 latency_ms"
+
+# Time ranges (requires --time-field)
+vigil "timestamp > -1h | count"
+
+# Limit results
+vigil "level = ERROR | tail 5"
+
+# Stop the daemon
+vigil --stop
+```
+
+## Documentation
+
+- [Query language](docs/query-language.md) — filters, operators, `AND`/`OR`/`NOT`, time ranges, aggregations, `limit`/`tail`
+- [Operations](docs/operations.md) — CLI flags, socket, data directory, persistence tuning, retention, log rotation, troubleshooting
+- [Architecture](docs/architecture.md) — tailer, index, WAL, snapshots, recovery semantics, durability guarantees and their limits
 
 ## Limitations
 
-- **In-memory index.** The entire log file is indexed in RAM. Not suited for files larger than available memory.
-- **One file per daemon.** Each daemon instance watches a single file.
+- **In-memory index.** The entire log file is indexed in RAM. Not suited for files larger than available memory. Use [`--max-events`](docs/operations.md#retention---max-events) to bound memory.
+- **One daemon per machine, one file at a time.** The daemon listens on a fixed socket path; running `vigil --watch` while a daemon is up re-points it at the new file.
 - **Time range queries require `--time-field`.** Without it, the time field is treated as a regular string field.

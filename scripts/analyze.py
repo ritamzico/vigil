@@ -139,7 +139,6 @@ def main():
     with open(os.path.join(args.outdir, "report_body.md"), "w") as f:
         f.write("\n".join(md))
 
-    # console summary
     print(res.to_string(index=False))
     print("\nwrote results.csv, report_body.md, and plots to", args.outdir)
 

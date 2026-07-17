@@ -1,7 +1,7 @@
 use crate::event::PersistedEvent;
 use crate::index::Index;
 use crate::snapshot::Snapshot;
-use crate::wal::WAL;
+use crate::wal::Wal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -12,7 +12,7 @@ use tokio::{io, sync::Mutex};
 pub async fn checkpoint(
     dir: &Path,
     index: &Arc<RwLock<Index>>,
-    wal: &Arc<Mutex<WAL>>,
+    wal: &Arc<Mutex<Wal>>,
     time_field: &Option<String>,
 ) -> io::Result<()> {
     let mut wal_guard = wal.lock().await;
@@ -26,7 +26,7 @@ pub async fn checkpoint(
             index_guard
                 .events
                 .iter()
-                .map(|event| PersistedEvent::from_event(event))
+                .map(PersistedEvent::from_event)
                 .collect(),
         )
     };
@@ -37,7 +37,7 @@ pub async fn checkpoint(
     Ok(())
 }
 
-pub async fn run_flush_task(wal: Arc<Mutex<WAL>>, interval: Duration) -> io::Result<()> {
+pub async fn run_flush_task(wal: Arc<Mutex<Wal>>, interval: Duration) -> io::Result<()> {
     loop {
         sleep(interval).await;
         wal.lock().await.flush_fsync().await?;
@@ -47,7 +47,7 @@ pub async fn run_flush_task(wal: Arc<Mutex<WAL>>, interval: Duration) -> io::Res
 pub async fn run_checkpoint_task(
     dir: PathBuf,
     index: Arc<RwLock<Index>>,
-    wal: Arc<Mutex<WAL>>,
+    wal: Arc<Mutex<Wal>>,
     time_field: Option<String>,
     interval: Duration,
 ) -> io::Result<()> {
@@ -68,8 +68,8 @@ mod tests {
         Event::new(None, raw.to_string(), HashMap::new())
     }
 
-    async fn make_wal(dir: &Path) -> Arc<Mutex<WAL>> {
-        let wal = WAL::open(&dir.join("wal.log"), None).await.unwrap();
+    async fn make_wal(dir: &Path) -> Arc<Mutex<Wal>> {
+        let wal = Wal::open(&dir.join("wal.log"), None).await.unwrap();
         Arc::new(Mutex::new(wal))
     }
 
@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_flush_task_flushes_unsynced_appends() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let wal = Arc::new(Mutex::new(WAL::open(tmp.path(), None).await.unwrap()));
+        let wal = Arc::new(Mutex::new(Wal::open(tmp.path(), None).await.unwrap()));
 
         wal.lock()
             .await

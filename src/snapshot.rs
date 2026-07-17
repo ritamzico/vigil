@@ -57,6 +57,13 @@ impl Snapshot {
 
         rename(&temp_path, &bin_path).await?;
 
+        // Make the rename durable before the caller truncates the WAL —
+        // otherwise a crash could surface the old snapshot next to an
+        // already-empty WAL and lose everything in between.
+        if let Ok(dir_file) = File::open(dir).await {
+            dir_file.sync_all().await?;
+        }
+
         Ok(())
     }
 

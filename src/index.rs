@@ -99,7 +99,7 @@ impl Index {
 
                 let mut values = numeric_values(&events, field)?;
 
-                values.sort_by(|a, b| a.total_cmp(b));
+                values.sort_by(f32::total_cmp);
                 let i = (*p * values.len() as f32).ceil() as usize - 1;
 
                 Ok(QueryResult::Scalar(values[i]))
@@ -895,7 +895,6 @@ mod tests {
         idx.push_event(make_event_raw("e2", vec![("status", Value::Number(200.0))]));
         idx.push_event(make_event_raw("e3", vec![("status", Value::Number(500.0))]));
 
-        // NOT status = 500
         let q = Query::Not(Box::new(eq("status", Value::Number(500.0))));
         let raws: Vec<&str> = idx.apply_query(&q).iter().map(|e| e.raw.as_str()).collect();
         assert_eq!(raws, vec!["e2"]);
@@ -951,7 +950,6 @@ mod tests {
             ],
         ));
 
-        // status = 500 AND NOT level = info
         let q = Query::And(vec![
             eq("status", Value::Number(500.0)),
             Query::Not(Box::new(eq("level", Value::String("info".into())))),
@@ -997,7 +995,6 @@ mod tests {
         idx.push_event(make_event_raw("e2", vec![("c", Value::Number(3.0))]));
         idx.push_event(make_event_raw("e3", vec![("a", Value::Number(1.0))]));
 
-        // a = 1 AND b = 2 OR c = 3
         let q = Query::Or(vec![
             Query::And(vec![
                 eq("a", Value::Number(1.0)),

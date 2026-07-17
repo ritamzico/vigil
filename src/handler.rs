@@ -21,6 +21,10 @@ pub enum HandlerError {
     Io(#[from] io::Error),
 }
 
+// Requests are queries or tiny control messages; anything bigger is a client
+// bug or an attempt to exhaust the daemon's memory.
+const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+
 pub async fn handle_client(
     stream: UnixStream,
     index: Arc<RwLock<Index>>,
@@ -29,49 +33,58 @@ pub async fn handle_client(
     time_field: Option<String>,
     follow_tx: broadcast::Sender<Arc<Event>>,
 ) -> Result<(), HandlerError> {
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
 
     let mut buf: Vec<u8> = vec![];
-    reader.read_to_end(&mut buf).await?;
+    reader
+        .take(MAX_REQUEST_BYTES + 1)
+        .read_to_end(&mut buf)
+        .await?;
+    if buf.len() as u64 > MAX_REQUEST_BYTES {
+        return Err(HandlerError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request exceeds maximum size",
+        )));
+    }
     let message: Message =
         from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let response: Message;
 
-    match message.message_kind {
-        MessageKind::Query => {
-            response = match parse_query(&message.data, time_field.as_deref()) {
-                Err(e) => Message::new(MessageKind::QueryError, e.to_string()),
-                Ok(query_plan) => {
-                    let index_guard = index.read().unwrap();
-                    match index_guard.apply_query_plan(&query_plan) {
-                        Err(e) => Message::new(MessageKind::QueryError, e.to_string()),
-                        Ok(result) => Message::new(MessageKind::QueryResponse, result.to_string()),
-                    }
+    let response = match message.message_kind {
+        MessageKind::Query => match parse_query(&message.data, time_field.as_deref()) {
+            Err(e) => Message::new(MessageKind::QueryError, e.to_string()),
+            Ok(query_plan) => {
+                let index_guard = index.read().unwrap();
+                match index_guard.apply_query_plan(&query_plan) {
+                    Err(e) => Message::new(MessageKind::QueryError, e.to_string()),
+                    Ok(result) => Message::new(MessageKind::QueryResponse, result.to_string()),
                 }
-            };
-        }
+            }
+        },
         MessageKind::Shutdown => {
-            response = Message::new(MessageKind::ShutdownAck, String::new());
             let _ = shutdown_tx.send(()).await;
+            Message::new(MessageKind::ShutdownAck, String::new())
         }
         MessageKind::Watch => {
             let payload: WatchPayload = serde_json::from_str(&message.data)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let _ = watch_tx.send((payload.path, payload.time_field)).await;
-            response = Message::new(MessageKind::WatchAck, String::new());
+            Message::new(MessageKind::WatchAck, String::new())
         }
         MessageKind::Follow => {
             // Follow streams raw lines, not a framed Message response.
             return handle_follow(writer, &message.data, time_field, follow_tx).await;
         }
-        _ => panic!("Invalid Message variant"),
-    }
+        // Response kinds are never valid requests — tell the client, don't panic.
+        _ => Message::new(MessageKind::QueryError, "invalid request kind".to_string()),
+    };
 
     let bytes = to_vec(&response).unwrap();
 
     match writer.write_all(&bytes).await {
         Ok(()) => {
-            writer.shutdown().await.unwrap();
+            if let Err(e) = writer.shutdown().await {
+                eprintln!("Failed to close client connection: {e}");
+            }
         }
         Err(_) => eprintln!("Failed to write to client."),
     }
@@ -235,6 +248,46 @@ mod tests {
 
         assert!(matches!(response.message_kind, MessageKind::QueryResponse));
         assert_eq!(response.data, "2");
+    }
+
+    #[tokio::test]
+    async fn test_response_kind_request_returns_error_not_panic() {
+        // A malicious or confused client sending a response-kind message must
+        // get an error back — it previously panicked the handler task.
+        let index = make_index(vec![]);
+
+        let (response, _) = roundtrip(
+            index,
+            Message::new(MessageKind::ShutdownAck, String::new()),
+        )
+        .await;
+
+        assert!(matches!(response.message_kind, MessageKind::QueryError));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_request_is_rejected() {
+        let index = make_index(vec![]);
+        let (client, server) = UnixStream::pair().unwrap();
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
+        let (watch_tx, _watch_rx) = mpsc::channel(1);
+        let (follow_tx, _) = broadcast::channel(16);
+
+        let writer_task = tokio::spawn(async move {
+            let (_reader, mut writer) = client.into_split();
+            let chunk = vec![b'x'; 64 * 1024];
+            // 2 MiB of garbage, well past the 1 MiB request cap.
+            for _ in 0..32 {
+                if writer.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            let _ = writer.shutdown().await;
+        });
+
+        let result = handle_client(server, index, shutdown_tx, watch_tx, None, follow_tx).await;
+        assert!(result.is_err());
+        let _ = writer_task.await;
     }
 
     #[tokio::test]

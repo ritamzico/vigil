@@ -18,7 +18,7 @@ use crate::event::Event;
 use crate::index::Index;
 use crate::recover::data_dir;
 use crate::recover::recover;
-use crate::wal::WAL;
+use crate::wal::Wal;
 
 mod checkpoint;
 mod event;
@@ -97,6 +97,9 @@ async fn main() {
     }
 }
 
+// One parameter per CLI flag; a params struct for this single call site
+// would add ceremony without improving clarity.
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon(
     path: PathBuf,
     detach: bool,
@@ -140,6 +143,9 @@ async fn run_daemon(
         if let Some(max_events) = max_events {
             cmd.arg("--max-events").arg(max_events.to_string());
         }
+        // Intentional daemonization: the parent exits right after spawning,
+        // so the child is reparented to init and never left a zombie.
+        #[allow(clippy::zombie_processes)]
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -164,7 +170,7 @@ async fn run_daemon(
     .await;
 
     let index = Arc::new(RwLock::new(index_inner));
-    let mut wal: Option<Arc<Mutex<WAL>>> = wal_inner.map(|w| Arc::new(Mutex::new(w)));
+    let mut wal: Option<Arc<Mutex<Wal>>> = wal_inner.map(|w| Arc::new(Mutex::new(w)));
 
     // Ingest the file's existing contents before accepting queries, so a client
     // that connects the instant the socket appears never sees a partial index.
@@ -180,6 +186,17 @@ async fn run_daemon(
         };
 
     let listener = UnixListener::bind(message::SOCKET_PATH).unwrap();
+    // The socket accepts queries and shutdown/watch commands — only the owner
+    // may talk to it.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(
+            message::SOCKET_PATH,
+            std::fs::Permissions::from_mode(0o600),
+        ) {
+            eprintln!("Failed to restrict socket permissions: {e}");
+        }
+    }
 
     let (follow_tx, _) = broadcast::channel::<Arc<Event>>(1024);
 
@@ -232,18 +249,25 @@ async fn run_daemon(
                 );
             }
             Ok((stream, _)) = listener.accept() => {
-                // Spawned without awaiting: a long-lived follow client must not
-                // block the accept loop, new connections, or shutdown handling.
-                let client = handler::handle_client(
-                    stream,
-                    index.clone(),
-                    shutdown_tx.clone(),
-                    watch_tx.clone(),
-                    current_time_field.clone(),
-                    follow_tx.clone(),
-                );
+                // Handle the client in its own task: a slow, stalled, or
+                // long-lived follow client must not block the accept loop
+                // (or shutdown) behind it.
+                let client_index = index.clone();
+                let client_shutdown_tx = shutdown_tx.clone();
+                let client_watch_tx = watch_tx.clone();
+                let client_time_field = current_time_field.clone();
+                let client_follow_tx = follow_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = client.await {
+                    if let Err(e) = handler::handle_client(
+                        stream,
+                        client_index,
+                        client_shutdown_tx,
+                        client_watch_tx,
+                        client_time_field,
+                        client_follow_tx,
+                    )
+                    .await
+                    {
                         eprintln!("Client error: {e}");
                     }
                 });
@@ -312,7 +336,7 @@ async fn resolve_state(
     data_dir_override: Option<PathBuf>,
     no_persist: bool,
     max_events: Option<usize>,
-) -> (Index, Option<WAL>, u64, Option<PathBuf>) {
+) -> (Index, Option<Wal>, u64, Option<PathBuf>) {
     if no_persist {
         return (Index::new(max_events), None, 0, None);
     }
@@ -345,7 +369,7 @@ async fn resolve_state(
 }
 
 fn spawn_flush_task(
-    wal: &Option<Arc<Mutex<WAL>>>,
+    wal: &Option<Arc<Mutex<Wal>>>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<io::Result<()>> {
     match wal {
@@ -357,7 +381,7 @@ fn spawn_flush_task(
 fn spawn_checkpoint_task(
     dir: &Option<PathBuf>,
     index: &Arc<RwLock<Index>>,
-    wal: &Option<Arc<Mutex<WAL>>>,
+    wal: &Option<Arc<Mutex<Wal>>>,
     time_field: &Option<String>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<io::Result<()>> {
@@ -386,7 +410,7 @@ async fn send_watch(path: PathBuf, time_field: Option<String>) -> Result<(), io:
         from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     match response.message_kind {
         MessageKind::WatchAck => Ok(()),
-        _ => Err(io::Error::new(io::ErrorKind::Other, "unexpected response")),
+        _ => Err(io::Error::other("unexpected response")),
     }
 }
 
