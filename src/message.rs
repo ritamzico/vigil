@@ -12,6 +12,7 @@ pub enum MessageKind {
     ShutdownAck,
     Watch,
     WatchAck,
+    Follow,
 }
 
 #[derive(Serialize, Deserialize)]

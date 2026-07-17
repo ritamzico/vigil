@@ -14,6 +14,7 @@ use std::sync::RwLock;
 use tokio::fs;
 use tokio::fs::File;
 use tokio::io::{self, AsyncBufReadExt, AsyncSeekExt};
+use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 
@@ -30,8 +31,18 @@ pub async fn initial_read(
     starting_byte_offset: u64,
 ) -> Result<u64, io::Error> {
     // Strict: a malformed line in the pre-existing file is reported to the
-    // user at startup instead of being silently skipped.
-    read_file(file_path, index, starting_byte_offset, time_field, wal, true).await
+    // user at startup instead of being silently skipped. Runs before the
+    // query socket opens, so nobody can be following yet.
+    read_file(
+        file_path,
+        index,
+        starting_byte_offset,
+        time_field,
+        wal,
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn run_tailer(
@@ -40,6 +51,7 @@ pub async fn run_tailer(
     time_field: Option<String>,
     wal: Option<Arc<Mutex<Wal>>>,
     starting_byte_offset: u64,
+    follow_tx: broadcast::Sender<Arc<Event>>,
 ) -> Result<(), io::Error> {
     let mut byte_offset = starting_byte_offset;
 
@@ -56,6 +68,7 @@ pub async fn run_tailer(
             time_field.as_deref(),
             &wal,
             false,
+            Some(&follow_tx),
         )
         .await?;
         sleep(Duration::from_millis(SLEEP_TIME)).await;
@@ -87,6 +100,7 @@ async fn read_file(
     time_field: Option<&str>,
     wal: &Option<Arc<Mutex<Wal>>>,
     strict: bool,
+    follow_tx: Option<&broadcast::Sender<Arc<Event>>>,
 ) -> Result<u64, io::Error> {
     let Ok(file) = File::open(file_path).await else {
         return Ok(byte_offset);
@@ -149,6 +163,13 @@ async fn read_file(
 
         let event = Event::new(timestamp, line, fields);
 
+        if let Some(tx) = follow_tx {
+            // Zero cost when nobody follows.
+            if tx.receiver_count() > 0 {
+                let _ = tx.send(Arc::new(event.clone()));
+            }
+        }
+
         // Append to the WAL and push to the index while holding the WAL lock,
         // so a concurrent checkpoint (which snapshots the index under the WAL
         // lock) can never record this event's WAL state without the event.
@@ -190,9 +211,17 @@ mod tests {
         time_field: Option<&str>,
     ) -> u64 {
         let wal = make_wal().await;
-        read_file(&PathBuf::from(path), index, offset, time_field, &wal, true)
-            .await
-            .unwrap()
+        read_file(
+            &PathBuf::from(path),
+            index,
+            offset,
+            time_field,
+            &wal,
+            true,
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -213,6 +242,7 @@ mod tests {
             None,
             &None,
             true,
+            None,
         )
         .await
         .unwrap();
@@ -518,6 +548,7 @@ mod tests {
             None,
             &wal,
             true,
+            None,
         )
         .await;
         let err = result.unwrap_err().to_string();
@@ -540,7 +571,7 @@ mod tests {
 
         let index = make_index();
         let wal = make_wal().await;
-        let offset = read_file(&path, &index, 0, None, &wal, true).await.unwrap();
+        let offset = read_file(&path, &index, 0, None, &wal, true, None).await.unwrap();
 
         // Only the complete first line is ingested; the offset stops at its end.
         assert_eq!(index.read().unwrap().event_count(), 1);
@@ -551,7 +582,7 @@ mod tests {
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(f, "2}}").unwrap();
 
-        let offset = read_file(&path, &index, offset, None, &wal, true)
+        let offset = read_file(&path, &index, offset, None, &wal, true, None)
             .await
             .unwrap();
         assert_eq!(index.read().unwrap().event_count(), 2);
@@ -566,12 +597,12 @@ mod tests {
 
         let index = make_index();
         let wal = make_wal().await;
-        let offset = read_file(&path, &index, 0, None, &wal, true).await.unwrap();
+        let offset = read_file(&path, &index, 0, None, &wal, true, None).await.unwrap();
 
         assert_eq!(index.read().unwrap().event_count(), 2);
         // Offset covers the full file — re-reading from it yields nothing new.
         assert_eq!(offset, std::fs::metadata(&path).unwrap().len());
-        let offset2 = read_file(&path, &index, offset, None, &wal, true)
+        let offset2 = read_file(&path, &index, offset, None, &wal, true, None)
             .await
             .unwrap();
         assert_eq!(offset2, offset);
@@ -586,7 +617,7 @@ mod tests {
 
         let index = make_index();
         let wal = make_wal().await;
-        let offset = read_file(&path, &index, 0, None, &wal, false)
+        let offset = read_file(&path, &index, 0, None, &wal, false, None)
             .await
             .unwrap();
 

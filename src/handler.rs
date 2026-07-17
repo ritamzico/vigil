@@ -1,4 +1,5 @@
-use crate::index::Index;
+use crate::event::Event;
+use crate::index::{event_matches, Index};
 use crate::message::{Message, MessageKind, WatchPayload};
 use crate::parser::parse_query;
 use serde_json::from_slice;
@@ -9,7 +10,9 @@ use std::sync::RwLock;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{self, AsyncReadExt};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Error)]
@@ -28,6 +31,7 @@ pub async fn handle_client(
     shutdown_tx: mpsc::Sender<()>,
     watch_tx: mpsc::Sender<(PathBuf, Option<String>)>,
     time_field: Option<String>,
+    follow_tx: broadcast::Sender<Arc<Event>>,
 ) -> Result<(), HandlerError> {
     let (reader, mut writer) = stream.into_split();
 
@@ -66,6 +70,10 @@ pub async fn handle_client(
             let _ = watch_tx.send((payload.path, payload.time_field)).await;
             Message::new(MessageKind::WatchAck, String::new())
         }
+        MessageKind::Follow => {
+            // Follow streams raw lines, not a framed Message response.
+            return handle_follow(writer, &message.data, time_field, follow_tx).await;
+        }
         // Response kinds are never valid requests — tell the client, don't panic.
         _ => Message::new(MessageKind::QueryError, "invalid request kind".to_string()),
     };
@@ -79,6 +87,59 @@ pub async fn handle_client(
             }
         }
         Err(_) => eprintln!("Failed to write to client."),
+    }
+
+    Ok(())
+}
+
+/// Stream raw lines of newly ingested events matching `raw_query` until the
+/// client disconnects. Follow supports filters only — no `|` pipeline stages.
+async fn handle_follow(
+    mut writer: OwnedWriteHalf,
+    raw_query: &str,
+    time_field: Option<String>,
+    follow_tx: broadcast::Sender<Arc<Event>>,
+) -> Result<(), HandlerError> {
+    let query = if raw_query.contains('|') {
+        Err("follow supports filters only, not '|' stages".to_string())
+    } else {
+        match parse_query(raw_query, time_field.as_deref()) {
+            Err(e) => Err(e.to_string()),
+            Ok(plan) if plan.aggregation.is_some() => {
+                Err("follow supports filters only, not '|' stages".to_string())
+            }
+            Ok(plan) => Ok(plan.query),
+        }
+    };
+
+    let query = match query {
+        Ok(query) => query,
+        Err(e) => {
+            let _ = writer.write_all(format!("{e}\n").as_bytes()).await;
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+    };
+
+    let mut rx = follow_tx.subscribe();
+    // Drop our sender clone so the channel can close (and this loop end)
+    // once the daemon-side senders are gone.
+    drop(follow_tx);
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if !event_matches(&event, &query) {
+                    continue;
+                }
+                if writer.write_all(event.raw.as_bytes()).await.is_err()
+                    || writer.write_all(b"\n").await.is_err()
+                {
+                    break; // client went away
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
     }
 
     Ok(())
@@ -111,7 +172,15 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
         let (watch_tx, _watch_rx) = mpsc::channel(1);
-        tokio::spawn(handle_client(server, index, shutdown_tx, watch_tx, None));
+        let (follow_tx, _) = broadcast::channel(16);
+        tokio::spawn(handle_client(
+            server,
+            index,
+            shutdown_tx,
+            watch_tx,
+            None,
+            follow_tx,
+        ));
 
         let (mut reader, mut writer) = client.into_split();
         writer.write_all(&to_vec(&msg).unwrap()).await.unwrap();
@@ -202,6 +271,7 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
         let (watch_tx, _watch_rx) = mpsc::channel(1);
+        let (follow_tx, _) = broadcast::channel(16);
 
         let writer_task = tokio::spawn(async move {
             let (_reader, mut writer) = client.into_split();
@@ -215,7 +285,7 @@ mod tests {
             let _ = writer.shutdown().await;
         });
 
-        let result = handle_client(server, index, shutdown_tx, watch_tx, None).await;
+        let result = handle_client(server, index, shutdown_tx, watch_tx, None, follow_tx).await;
         assert!(result.is_err());
         let _ = writer_task.await;
     }
@@ -228,5 +298,91 @@ mod tests {
 
         assert!(matches!(response.message_kind, MessageKind::ShutdownAck));
         assert!(shutdown_rx.try_recv().is_ok());
+    }
+
+    // --- Follow ---
+
+    /// Send a Follow message and return the client's read half plus the
+    /// broadcast sender feeding the handler.
+    async fn start_follow(
+        query: &str,
+    ) -> (
+        tokio::net::unix::OwnedReadHalf,
+        broadcast::Sender<Arc<Event>>,
+    ) {
+        let index = make_index(vec![]);
+        let (client, server) = UnixStream::pair().unwrap();
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel::<()>(1);
+        let (watch_tx, _watch_rx) = mpsc::channel(1);
+        let (follow_tx, _) = broadcast::channel(16);
+        tokio::spawn(handle_client(
+            server,
+            index,
+            shutdown_tx,
+            watch_tx,
+            None,
+            follow_tx.clone(),
+        ));
+
+        let (reader, mut writer) = client.into_split();
+        let msg = Message::new(MessageKind::Follow, query.to_string());
+        writer.write_all(&to_vec(&msg).unwrap()).await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        (reader, follow_tx)
+    }
+
+    #[tokio::test]
+    async fn test_follow_streams_only_matching_raw_lines() {
+        let (mut reader, follow_tx) = start_follow("level = ERROR").await;
+
+        // Wait for the handler to subscribe so the events aren't dropped.
+        while follow_tx.receiver_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        follow_tx
+            .send(Arc::new(make_event(
+                "matching",
+                vec![("level", Value::String("ERROR".into()))],
+            )))
+            .unwrap();
+        follow_tx
+            .send(Arc::new(make_event(
+                "non-matching",
+                vec![("level", Value::String("INFO".into()))],
+            )))
+            .unwrap();
+
+        // Drop the sender so the handler sees Closed and ends the stream.
+        drop(follow_tx);
+
+        let mut buf = vec![];
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8(buf).unwrap(), "matching\n");
+    }
+
+    #[tokio::test]
+    async fn test_follow_rejects_pipeline_stages() {
+        let (mut reader, follow_tx) = start_follow("level = ERROR | count").await;
+
+        let mut buf = vec![];
+        reader.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains("follow supports filters only"),
+            "unexpected response: {text}"
+        );
+        assert_eq!(follow_tx.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_follow_parse_error_writes_error_and_closes() {
+        let (mut reader, follow_tx) = start_follow("level ???").await;
+
+        let mut buf = vec![];
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert!(!buf.is_empty());
+        assert_eq!(follow_tx.receiver_count(), 0);
     }
 }

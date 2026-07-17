@@ -6,6 +6,7 @@ A fast, queryable log watcher for structured JSON logs. Run it as a daemon point
 vigil --watch app.log --time-field timestamp
 vigil "level = ERROR AND status >= 500 | count"
 vigil "level = ERROR | p99 latency_ms"
+vigil -f "level = ERROR"
 ```
 
 ## How it works
